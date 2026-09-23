@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -33,6 +34,107 @@ from hypertrace.retrieval.base import Retrieval
 
 class BudgetStop(Exception):
     pass
+
+
+ASSESSMENT_LIMIT = 16_000
+WINDOW_CONTEXT = 400
+SEARCH_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "among",
+    "and",
+    "any",
+    "are",
+    "before",
+    "between",
+    "could",
+    "dated",
+    "did",
+    "does",
+    "earliest",
+    "from",
+    "have",
+    "into",
+    "its",
+    "modern",
+    "name",
+    "origin",
+    "other",
+    "relationship",
+    "search",
+    "source",
+    "term",
+    "that",
+    "the",
+    "their",
+    "these",
+    "this",
+    "those",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "would",
+}
+
+
+def _relevance_windows(
+    source: Source, question: str, hypotheses: list[dict], query: str
+) -> list[dict]:
+    words = " ".join(
+        [
+            question,
+            query,
+            *(item["statement"] for item in hypotheses if item["status"] != "rejected"),
+        ]
+    )
+    terms = {
+        word.lower()
+        for word in re.findall(r"[^\W_]+", words)
+        if len(word) >= 3 and word.lower() not in SEARCH_STOPWORDS
+    }
+    if not terms:
+        return []
+
+    # Join adjacent body fragments only across whitespace. Furniture breaks a body run.
+    body_spans: list[list[int]] = []
+    for region in sorted(source.content_regions, key=lambda item: item.start):
+        if region.region != QuoteRegion.ARTICLE_BODY:
+            continue
+        if body_spans and not source.content[body_spans[-1][1] : region.start].strip():
+            body_spans[-1][1] = max(body_spans[-1][1], region.end)
+        else:
+            body_spans.append([region.start, region.end])
+
+    hits: list[tuple[int, int, int, int, int]] = []
+    for term in terms:
+        pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
+        matches = [
+            (span_start + match.start(), span_start + match.end(), span_start, span_end)
+            for span_start, span_end in body_spans
+            for match in pattern.finditer(source.content[span_start:span_end])
+        ]
+        hits.extend((len(matches), -len(term), *match) for match in matches)
+
+    windows: list[tuple[int, int]] = []
+    for _, _, hit_start, hit_end, span_start, span_end in sorted(hits):
+        start = max(span_start, hit_start - WINDOW_CONTEXT)
+        end = min(span_end, hit_end + WINDOW_CONTEXT)
+        merged: list[tuple[int, int]] = []
+        for old_start, old_end in sorted([*windows, (start, end)]):
+            if merged and old_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], old_end))
+            else:
+                merged.append((old_start, old_end))
+        if sum(end - start for start, end in merged) <= ASSESSMENT_LIMIT:
+            windows = merged
+    return [
+        {"start": start, "end": end, "text": source.content[start:end]} for start, end in windows
+    ]
 
 
 class _AttemptLogger:
@@ -389,14 +491,33 @@ class Researcher:
                 retryable=False,
             )
             return False
-        if len(source.content) > 16_000:
-            self.db.record_fetch_failure(
-                candidate["id"],
-                "Fetched text exceeds the 16,000-character assessment window",
-                retryable=False,
-            )
-            return False
         context = self._context()
+        mode = "full_document"
+        source_text: dict = {"text": source.content}
+        if len(source.content) > ASSESSMENT_LIMIT:
+            mode = "relevance_windows"
+            query = self.db.rows("SELECT query FROM queries WHERE id=?", (candidate["query_id"],))[
+                0
+            ]
+            windows = _relevance_windows(
+                source, context["question"], context["hypotheses"], query[0]
+            )
+            if not windows:
+                self.db.persist_candidate_assessment(candidate["id"], [], [], [], mode)
+                self._record("assess", f"source_id={source_id} mode={mode} no relevant body terms")
+                return True
+            source_text = {"windows": windows}
+        source_metadata = {
+            "id": source_id,
+            "url": source.retrieved_url,
+            "title": source.title,
+            "page_publication_date": source.page_publication_date,
+            "source_type": source.source_type,
+            "assessment_mode": mode,
+        }
+        if mode == "full_document":
+            source_metadata["canonical_alias"] = source.canonical_url
+            source_metadata["dating_notes"] = source.dating_notes
         try:
             assessment: PageAssessment = await self._complete(
                 "assess",
@@ -406,16 +527,7 @@ class Researcher:
                     {
                         "question": context["question"],
                         "hypotheses": context["hypotheses"],
-                        "source": {
-                            "id": source_id,
-                            "url": source.retrieved_url,
-                            "canonical_alias": source.canonical_url,
-                            "title": source.title,
-                            "page_publication_date": source.page_publication_date,
-                            "dating_notes": source.dating_notes,
-                            "source_type": source.source_type,
-                            "text": source.content[:16000],
-                        },
+                        "source": {**source_metadata, **source_text},
                     },
                     ensure_ascii=False,
                 ),
@@ -431,7 +543,7 @@ class Researcher:
         valid_ids = {h["id"] for h in context["hypotheses"]}
         if assessment.relevant:
             for item_evidence in assessment.evidence:
-                if item_evidence.exact_quote not in source.content[:16000]:
+                if item_evidence.exact_quote not in source.content:
                     continue
                 region = self.db.quote_region(source_id, item_evidence.exact_quote)
                 if (
@@ -506,7 +618,7 @@ class Researcher:
                     )
                 )
         added = self.db.persist_candidate_assessment(
-            candidate["id"], evidence_records, lead_records, query_records
+            candidate["id"], evidence_records, lead_records, query_records, mode
         )
         self.evidence_added += added
         return True

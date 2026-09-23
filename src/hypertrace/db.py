@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES queries(id),
   url TEXT NOT NULL, title TEXT NOT NULL, source_id INTEGER REFERENCES sources(id),
   assessed_at TEXT, fetch_error TEXT, failure_at TEXT, assessment_error TEXT,
+  assessment_mode TEXT CHECK(assessment_mode IN ('full_document','relevance_windows')),
   UNIQUE(query_id, url)
 );
 CREATE TABLE IF NOT EXISTS evidence (
@@ -145,7 +146,11 @@ class Database:
                 "page_publication_date": "TEXT",
                 "regions_json": "TEXT NOT NULL DEFAULT '[]'",
             },
-            "candidates": {"failure_at": "TEXT", "assessment_error": "TEXT"},
+            "candidates": {
+                "failure_at": "TEXT",
+                "assessment_error": "TEXT",
+                "assessment_mode": "TEXT",
+            },
             "evidence": {
                 "quote_region": "TEXT NOT NULL DEFAULT 'unknown'",
                 "quote_context": "TEXT NOT NULL DEFAULT ''",
@@ -173,6 +178,11 @@ class Database:
             self.conn.execute(
                 "UPDATE sources SET page_publication_date=publication_date "
                 "WHERE page_publication_date IS NULL AND publication_date IS NOT NULL"
+            )
+            self.conn.execute(
+                "UPDATE candidates SET failure_at=NULL,fetch_error=NULL "
+                "WHERE source_id IS NOT NULL AND assessed_at IS NULL "
+                "AND fetch_error='Fetched text exceeds the 16,000-character assessment window'"
             )
             if legacy_evidence:
                 self.conn.execute(
@@ -577,7 +587,10 @@ class Database:
         evidence: list[tuple[Evidence, list[tuple[int, str, str]]]],
         leads: list[ResearchLead],
         queries: list[SearchQuery],
+        mode: str = "full_document",
     ) -> int:
+        if mode not in {"full_document", "relevance_windows"}:
+            raise ValueError("Unknown assessment mode")
         candidate = self.conn.execute(
             "SELECT source_id,assessed_at,failure_at FROM candidates WHERE id=?", (candidate_id,)
         ).fetchone()
@@ -602,9 +615,10 @@ class Database:
             for query in queries:
                 self._add_query_tx(query)
             self.conn.execute(
-                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL "
+                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL,"
+                "assessment_mode=? "
                 "WHERE id=?",
-                (utc_now(), candidate_id),
+                (utc_now(), mode, candidate_id),
             )
         return len(evidence)
 

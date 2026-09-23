@@ -260,6 +260,155 @@ def _config(tmp_path) -> Config:
     )
 
 
+class WindowLLM(FakeLLM):
+    def __init__(self, quote: str | None = None):
+        self.prompts = []
+        self.quote = quote
+
+    async def complete(self, model, system, user, schema):
+        if schema is PageAssessment:
+            self.prompts.append(json.loads(user))
+            evidence = (
+                [
+                    {
+                        "exact_quote": self.quote,
+                        "normalized_claim": self.quote,
+                        "evidence_type": "observed_usage",
+                    }
+                ]
+                if self.quote
+                else []
+            )
+            return LLMResult(
+                value=PageAssessment(relevant=bool(evidence), reason="checked", evidence=evidence),
+                input_tokens=10,
+                output_tokens=5,
+            )
+        return await super().complete(model, system, user, schema)
+
+
+def _assess_stored_page(
+    db,
+    config,
+    source,
+    llm,
+    *,
+    question="Where was zephyrcore used?",
+    query="zephyrcore history",
+    hypothesis=None,
+):
+    qid = db.add_question(ResearchQuestion(question=question))
+    if hypothesis:
+        db.add_hypothesis(Hypothesis(research_question_id=qid, statement=hypothesis))
+    query_id = db.add_query(SearchQuery(research_question_id=qid, query=query))
+    db.mark_query_executed(query_id)
+    db.add_candidate(query_id, source.retrieved_url, source.title)
+    candidate_id = db.pending_candidate(qid)["id"]
+    db.set_candidate_source(candidate_id, db.add_source(source))
+    retrieval = FakeRetrieval()
+    researcher = Researcher(db, llm, retrieval, config, qid, Limits(max_actions=1))
+    asyncio.run(researcher.run())
+    assert retrieval.fetches == 0
+    return qid, candidate_id
+
+
+def test_long_page_one_relevant_body_occurrence_is_assessed(tmp_path):
+    config = _config(tmp_path)
+    navigation = "Zephyrcore appears in navigation. "
+    body = "filler " * 2600 + "An article discusses zephyrcore here."
+    content = navigation + body
+    source = _source("https://example.org/long-one", content).model_copy(
+        update={
+            "content_regions": [
+                ContentRegion(start=0, end=len(navigation), region=QuoteRegion.NAVIGATION),
+                ContentRegion(
+                    start=len(navigation), end=len(content), region=QuoteRegion.ARTICLE_BODY
+                ),
+            ],
+        }
+    )
+    llm = WindowLLM()
+    with Database(config.db_path) as db:
+        _, candidate_id = _assess_stored_page(db, config, source, llm)
+        row = db.rows(
+            "SELECT assessed_at,assessment_mode FROM candidates WHERE id=?", (candidate_id,)
+        )[0]
+        assert row["assessed_at"] and row["assessment_mode"] == "relevance_windows"
+        windows = llm.prompts[0]["source"]["windows"]
+        assert len(windows) == 1
+        assert "zephyrcore here" in windows[0]["text"]
+        assert "navigation" not in windows[0]["text"]
+        assert windows[0]["text"] == content[windows[0]["start"] : windows[0]["end"]]
+        assert sum(len(window["text"]) for window in windows) <= 16_000
+        assert "text" not in llm.prompts[0]["source"]
+
+
+def test_long_page_nearby_occurrences_merge_windows(tmp_path):
+    config = _config(tmp_path)
+    content = "filler " * 2500 + "zephyrcore " + "context " * 20 + "zephyrcore" + " tail " * 100
+    llm = WindowLLM()
+    with Database(config.db_path) as db:
+        source = _source("https://example.org/long-nearby", content)
+        _assess_stored_page(db, config, source, llm, question="Where was the style discussed?")
+        windows = llm.prompts[0]["source"]["windows"]
+        assert len(windows) == 1
+        assert windows[0]["text"].count("zephyrcore") == 2
+        assert windows[0]["start"] <= content.index("zephyrcore")
+        assert windows[0]["end"] >= content.rindex("zephyrcore") + len("zephyrcore")
+
+
+def test_long_page_without_relevant_body_term_skips_model(tmp_path):
+    config = _config(tmp_path)
+    navigation = "zephyrcore "
+    content = navigation + "unrelated article body " * 1100
+    source = _source("https://example.org/long-unrelated", content).model_copy(
+        update={
+            "content_regions": [
+                ContentRegion(start=0, end=len(navigation), region=QuoteRegion.NAVIGATION),
+                ContentRegion(
+                    start=len(navigation), end=len(content), region=QuoteRegion.ARTICLE_BODY
+                ),
+            ],
+        }
+    )
+    llm = WindowLLM()
+    with Database(config.db_path) as db:
+        _, candidate_id = _assess_stored_page(db, config, source, llm)
+        assert llm.prompts == []
+        row = db.rows(
+            "SELECT assessed_at,assessment_mode FROM candidates WHERE id=?", (candidate_id,)
+        )[0]
+        assert row["assessed_at"] and row["assessment_mode"] == "relevance_windows"
+        assert not db.rows("SELECT id FROM evidence")
+
+
+def test_long_page_excerpt_validates_against_full_stored_source(tmp_path):
+    config = _config(tmp_path)
+    quote = "This article names zephyrcore as a style."
+    content = "earlier text " * 1500 + quote + " following context " * 40
+    llm = WindowLLM(quote)
+    with Database(config.db_path) as db:
+        source = _source("https://example.org/long-evidence", content)
+        qid, candidate_id = _assess_stored_page(
+            db,
+            config,
+            source,
+            llm,
+            question="What musical style was discussed?",
+            query="historical discussion",
+            hypothesis="Zephyrcore was named as a style.",
+        )
+        evidence = db.rows("SELECT * FROM evidence WHERE research_question_id=?", (qid,))[0]
+        assert evidence["quote_start"] == content.index(quote) > 16_000
+        assert evidence["quote_region"] == "article_body"
+        assert quote in evidence["quote_context"]
+        assert evidence["quote_verified_date"] is None
+        assert (
+            db.rows("SELECT assessment_mode FROM candidates WHERE id=?", (candidate_id,))[0][0]
+            == "relevance_windows"
+        )
+
+
 def test_bounded_run_resumes_candidate_and_never_uses_snippet_as_evidence(tmp_path):
     config = _config(tmp_path)
     retrieval = FakeRetrieval()
