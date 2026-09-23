@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS candidates (
   id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES queries(id),
   url TEXT NOT NULL, title TEXT NOT NULL, source_id INTEGER REFERENCES sources(id),
-  assessed_at TEXT, fetch_error TEXT, failure_at TEXT, UNIQUE(query_id, url)
+  assessed_at TEXT, fetch_error TEXT, failure_at TEXT, assessment_error TEXT,
+  UNIQUE(query_id, url)
 );
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
@@ -144,7 +145,7 @@ class Database:
                 "page_publication_date": "TEXT",
                 "regions_json": "TEXT NOT NULL DEFAULT '[]'",
             },
-            "candidates": {"failure_at": "TEXT"},
+            "candidates": {"failure_at": "TEXT", "assessment_error": "TEXT"},
             "evidence": {
                 "quote_region": "TEXT NOT NULL DEFAULT 'unknown'",
                 "quote_context": "TEXT NOT NULL DEFAULT ''",
@@ -303,7 +304,8 @@ class Database:
             raise ValueError("Fetch failures must remain unresolved")
         with self.conn:
             self.conn.execute(
-                "UPDATE candidates SET assessed_at=?,fetch_error=NULL WHERE id=?",
+                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL "
+                "WHERE id=?",
                 (utc_now(), candidate_id),
             )
 
@@ -312,6 +314,14 @@ class Database:
             self.conn.execute(
                 "UPDATE candidates SET fetch_error=?,failure_at=? WHERE id=?",
                 (reason, None if retryable else utc_now(), candidate_id),
+            )
+
+    def record_assessment_failure(self, candidate_id: int, error: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE candidates SET assessment_error=? "
+                "WHERE id=? AND source_id IS NOT NULL AND assessed_at IS NULL",
+                (error, candidate_id),
             )
 
     def document_already_assessed(self, content_hash: str, question_id: int) -> bool:
@@ -592,7 +602,8 @@ class Database:
             for query in queries:
                 self._add_query_tx(query)
             self.conn.execute(
-                "UPDATE candidates SET assessed_at=?,fetch_error=NULL WHERE id=?",
+                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL "
+                "WHERE id=?",
                 (utc_now(), candidate_id),
             )
         return len(evidence)

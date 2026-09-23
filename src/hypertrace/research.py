@@ -168,9 +168,13 @@ class Researcher:
                 + 1024
             )
             attempts = getattr(self.llm, "max_retries", 0) + 1
-            if provider_tracked and schema is AdversarialReview:
+            if provider_tracked:
                 attempts += 1  # One possible schema correction request.
-            max_output_tokens = self.llm.max_tokens_for(schema) if provider_tracked else 1500
+            max_output_tokens = (
+                self.llm.structured_call_policy(model).max_completion_tokens
+                if provider_tracked
+                else 1500
+            )
             reserve = (
                 attempts
                 * (
@@ -393,29 +397,35 @@ class Researcher:
             )
             return False
         context = self._context()
-        assessment: PageAssessment = await self._complete(
-            "assess",
-            self.model,
-            ASSESS_SYSTEM,
-            json.dumps(
-                {
-                    "question": context["question"],
-                    "hypotheses": context["hypotheses"],
-                    "source": {
-                        "id": source_id,
-                        "url": source.retrieved_url,
-                        "canonical_alias": source.canonical_url,
-                        "title": source.title,
-                        "page_publication_date": source.page_publication_date,
-                        "dating_notes": source.dating_notes,
-                        "source_type": source.source_type,
-                        "text": source.content[:16000],
+        try:
+            assessment: PageAssessment = await self._complete(
+                "assess",
+                self.model,
+                ASSESS_SYSTEM,
+                json.dumps(
+                    {
+                        "question": context["question"],
+                        "hypotheses": context["hypotheses"],
+                        "source": {
+                            "id": source_id,
+                            "url": source.retrieved_url,
+                            "canonical_alias": source.canonical_url,
+                            "title": source.title,
+                            "page_publication_date": source.page_publication_date,
+                            "dating_notes": source.dating_notes,
+                            "source_type": source.source_type,
+                            "text": source.content[:16000],
+                        },
                     },
-                },
-                ensure_ascii=False,
-            ),
-            PageAssessment,
-        )
+                    ensure_ascii=False,
+                ),
+                PageAssessment,
+            )
+        except BudgetStop:
+            raise
+        except Exception as exc:
+            self.db.record_assessment_failure(candidate["id"], self._safe_completion_error(exc))
+            raise BudgetStop("candidate_assessment_failed") from exc
         evidence_records: list[tuple[Evidence, list[tuple[int, str, str]]]] = []
         lead_records: list[ResearchLead] = []
         valid_ids = {h["id"] for h in context["hypotheses"]}

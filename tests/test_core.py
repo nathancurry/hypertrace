@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -116,8 +117,8 @@ def test_structured_llm_retries_invalid_json_and_stops():
         nonlocal calls
         calls += 1
         body = json.loads(request.content)
-        assert body["max_tokens"] == 1500
-        assert "max_completion_tokens" not in body
+        assert body["max_completion_tokens"] == 8000
+        assert "max_tokens" not in body
         assert "reasoning_effort" not in body
         content = '{"relevant": true, "reason": "ok"}' if calls == 2 else "not json"
         return httpx.Response(
@@ -145,6 +146,30 @@ def test_structured_llm_retries_invalid_json_and_stops():
                 await llm.complete("model", "system", "user", PageAssessment)
 
     asyncio.run(exercise())
+
+
+def test_page_assessment_valid_json_schema_error_gets_one_repair_call():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        content = (
+            '{"relevant": "unknown", "reason": "unclear"}'
+            if len(requests) == 1
+            else '{"relevant": false, "reason": "unclear"}'
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client, max_retries=0)
+            result = await llm.complete("model", "system", "page", PageAssessment)
+            assert result.value.relevant is False
+
+    asyncio.run(exercise())
+    assert len(requests) == 2
+    assert all(body["max_completion_tokens"] == 8000 for body in requests)
+    assert '"relevant": "unknown"' in requests[1]["messages"][1]["content"]
 
 
 def test_web_fetch_preserves_metadata_caveat_and_canonical_url():
@@ -838,6 +863,125 @@ def test_failed_review_resume_retries_without_duplicating_evidence(tmp_path):
                 assert [row["id"] for row in db.rows("SELECT id FROM evidence")] == [evidence_id]
                 assert retrieval.fetches == 0
                 assert calls == 2
+
+    asyncio.run(exercise())
+
+
+def test_reasoning_only_page_assessment_stops_and_resumes_without_duplicate_work(tmp_path):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["max_completion_tokens"] == 8000
+        assert "max_tokens" not in body
+        assert body["reasoning_effort"] == "low"
+        if len(requests) <= 2:
+            content = ""
+            reasoning = "thinking through the page"
+            finish_reason = "length"
+            completion_tokens = 8000
+        else:
+            content = '{"relevant": false, "reason": "No usable evidence"}'
+            reasoning = ""
+            finish_reason = "stop"
+            completion_tokens = 40
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": finish_reason,
+                        "message": {"content": content, "reasoning_content": reasoning},
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": completion_tokens},
+            },
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM(
+                "https://api.cheaperinference.com/v1", "key", client=client, max_retries=1
+            )
+            config = replace(_config(tmp_path), research_model="glm-5.3-flash")
+            with Database(config.db_path) as db:
+                qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+                query_id = db.add_query(
+                    SearchQuery(research_question_id=qid, query="hyperpop origin")
+                )
+                db.add_candidate(query_id, "https://example.org/prior", "Prior")
+                db.add_candidate(query_id, "https://example.org/page", "Page")
+                db.mark_query_executed(query_id)
+                prior = db.pending_candidate(qid)
+                prior_source_id = db.attach_source(
+                    prior["id"], _source(prior["url"], "Prior use of hyperpop.")
+                )
+                prior_evidence_id = db.add_evidence(
+                    Evidence(
+                        source_id=prior_source_id,
+                        research_question_id=qid,
+                        exact_quote="Prior use of hyperpop.",
+                        normalized_claim="Prior use of hyperpop.",
+                        evidence_type="observed_usage",
+                    )
+                )
+                db.finish_candidate(prior["id"])
+                candidate = db.pending_candidate(qid)
+                source_id = db.attach_source(
+                    candidate["id"], _source(candidate["url"], "A later discussion of hyperpop.")
+                )
+                retrieval = FakeRetrieval()
+                first = await Researcher(
+                    db, llm, retrieval, config, qid, Limits(max_actions=1)
+                ).run()
+                assert tuple(
+                    db.rows("SELECT status,stop_reason FROM runs WHERE id=?", (first,))[0]
+                ) == ("stopped", "candidate_assessment_failed")
+                pending = db.pending_candidate(qid)
+                assert pending["id"] == candidate["id"]
+                assert pending["source_id"] == source_id
+                assert pending["assessed_at"] is None
+                assert "empty_string" in pending["assessment_error"]
+                assert len(requests) == 2
+                assert "immediately with concise JSON matching the schema" in str(
+                    requests[1]["messages"]
+                )
+                attempts = db.rows(
+                    "SELECT outcome,diagnostics_json FROM provider_attempts WHERE run_id=?",
+                    (first,),
+                )
+                assert len(attempts) == 2
+                for attempt in attempts:
+                    assert attempt["outcome"] == "provider_output_failure"
+                    diagnostics = json.loads(attempt["diagnostics_json"])
+                    assert diagnostics["http_status"] == 200
+                    assert diagnostics["finish_reason"] == "length"
+                    assert diagnostics["content_chars"] == 0
+                    assert diagnostics["reasoning_content_chars"] > 0
+                    assert diagnostics["reported_completion_tokens"] == 8000
+                    assert diagnostics["max_completion_tokens"] == 8000
+                    assert diagnostics["reasoning_effort_requested"] == "low"
+                second = await Researcher(
+                    db, llm, retrieval, config, qid, Limits(max_actions=1)
+                ).run()
+                assert db.rows("SELECT stop_reason FROM runs WHERE id=?", (second,))[0][0] == (
+                    "max_actions"
+                )
+                assert db.pending_candidate(qid) is None
+                assert (
+                    db.rows(
+                        "SELECT assessment_error FROM candidates WHERE id=?", (candidate["id"],)
+                    )[0][0]
+                    is None
+                )
+                assert [row["id"] for row in db.rows("SELECT id FROM evidence")] == [
+                    prior_evidence_id
+                ]
+                assert len(db.rows("SELECT id FROM queries")) == 1
+                assert len(db.rows("SELECT id FROM sources")) == 2
+                assert retrieval.fetches == 0
+                assert len(requests) == 3
 
     asyncio.run(exercise())
 

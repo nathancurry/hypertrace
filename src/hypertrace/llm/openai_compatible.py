@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -12,7 +13,6 @@ import httpx
 from pydantic import ValidationError
 
 from hypertrace.llm.base import LLMResult, T
-from hypertrace.models import AdversarialReview
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,13 @@ class StructuredOutputError(ValueError):
 
 class ProviderOutputError(StructuredOutputError):
     """The provider returned no usable completion text."""
+
+
+@dataclass(frozen=True)
+class StructuredCallPolicy:
+    max_completion_tokens: int = 8000
+    timeout_seconds: int = 240
+    reasoning_effort: str | None = None
 
 
 def _safe_label(value: object, secret: str) -> str:
@@ -122,17 +129,21 @@ class OpenAICompatibleLLM:
         self._owns_client = client is None
         self.attempt_observer: AttemptObserver | None = None
 
-    @staticmethod
-    def max_tokens_for(schema: type) -> int:
-        # Review is the largest response and reasoning-capable providers may spend
-        # completion tokens before producing message.content.
-        return 8000 if schema is AdversarialReview else 1500
+    def structured_call_policy(self, model: str) -> StructuredCallPolicy:
+        reasoning_effort = (
+            "low"
+            if model == "glm-5.3-flash"
+            and urlsplit(self.base_url).hostname == "api.cheaperinference.com"
+            else None
+        )
+        return StructuredCallPolicy(reasoning_effort=reasoning_effort)
 
     async def aclose(self) -> None:
         if self._owns_client:
             await self.client.aclose()
 
     async def complete(self, model: str, system: str, user: str, schema: type[T]) -> LLMResult[T]:
+        policy = self.structured_call_policy(model)
         schema_text = json.dumps(schema.model_json_schema(), separators=(",", ":"))
         messages = [
             {
@@ -145,25 +156,18 @@ class OpenAICompatibleLLM:
         input_tokens = 0
         output_tokens = 0
         repair_pending = False
-        for attempt in range(
-            self.max_retries + 2 if schema is AdversarialReview else self.max_retries + 1
-        ):
+        for attempt in range(self.max_retries + 2):
             is_repair = repair_pending
             body: dict = {
                 "model": model,
                 "messages": messages,
                 "temperature": 0,
             }
-            token_field = "max_completion_tokens" if schema is AdversarialReview else "max_tokens"
-            body[token_field] = self.max_tokens_for(schema)
+            body["max_completion_tokens"] = policy.max_completion_tokens
             if self.json_mode:
                 body["response_format"] = {"type": "json_object"}
-            if (
-                schema is AdversarialReview
-                and model == "glm-5.3-flash"
-                and urlsplit(self.base_url).hostname == "api.cheaperinference.com"
-            ):
-                body["reasoning_effort"] = "low"
+            if policy.reasoning_effort:
+                body["reasoning_effort"] = policy.reasoning_effort
             observer = self.attempt_observer
             attempt_id = observer.started(model) if observer else None
             attempt_input: int | None = None
@@ -175,19 +179,23 @@ class OpenAICompatibleLLM:
                     f"{self.base_url}/chat/completions",
                     json=body,
                     headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=240 if schema is AdversarialReview else 60,
+                    timeout=policy.timeout_seconds,
                 )
                 try:
                     payload = response.json()
                 except json.JSONDecodeError:
                     payload = None
                 diagnostics = _response_diagnostics(response.status_code, payload, self.api_key)
+                diagnostics["max_completion_tokens"] = policy.max_completion_tokens
+                diagnostics["reasoning_effort_requested"] = policy.reasoning_effort
                 response.raise_for_status()
                 if not isinstance(payload, dict):
                     raise ProviderOutputError("Provider returned a non-object or non-JSON response")
                 if payload.get("error") is not None:
                     raise ProviderOutputError("Provider returned an error field")
                 usage = payload.get("usage") or {}
+                if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
+                    diagnostics["reported_completion_tokens"] = usage["completion_tokens"]
                 if isinstance(usage, dict) and (
                     usage.get("prompt_tokens") is not None
                     and usage.get("completion_tokens") is not None
@@ -203,6 +211,7 @@ class OpenAICompatibleLLM:
                 if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
                     raise ProviderOutputError("Provider returned no completion message")
                 content = choice["message"].get("content")
+                diagnostics["content_chars"] = len(content) if isinstance(content, str) else None
                 if content is None or (isinstance(content, str) and not content.strip()):
                     raise ProviderOutputError(
                         f"Provider returned {diagnostics['content_state']} completion content"
@@ -215,7 +224,7 @@ class OpenAICompatibleLLM:
                     value = schema.model_validate_json(content)
                 except ValidationError as exc:
                     error_types = sorted({item["type"] for item in exc.errors()})
-                    if schema is AdversarialReview and not is_repair:
+                    if not is_repair:
                         try:
                             invalid_object = json.loads(content)
                         except json.JSONDecodeError:
@@ -261,13 +270,25 @@ class OpenAICompatibleLLM:
                     else "invalid_response"
                 )
                 if not repair_pending:
+                    if (
+                        isinstance(exc, ProviderOutputError)
+                        and diagnostics["content_state"] in {"empty_string", "blank_string", "null"}
+                        and (diagnostics["reasoning_content_chars"] or 0) > 0
+                    ):
+                        instruction = (
+                            "The provider used its completion on reasoning and returned no final JSON. "
+                            "Respond immediately with concise JSON matching the schema; "
+                            "use minimal reasoning."
+                        )
+                    else:
+                        instruction = (
+                            f"Previous output failed validation: {str(exc)[:300]}. "
+                            "Return a corrected JSON object only."
+                        )
                     messages.append(
                         {
                             "role": "user",
-                            "content": (
-                                f"Previous output failed validation: {str(exc)[:300]}. "
-                                "Return a corrected JSON object only."
-                            ),
+                            "content": instruction,
                         }
                     )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
