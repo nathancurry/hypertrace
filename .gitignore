@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local config / secrets
+.env
+.env.*
+secrets.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+*.sqlite
+*.sqlite3
+hypertrace.db
