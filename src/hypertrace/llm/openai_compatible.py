@@ -126,7 +126,7 @@ class OpenAICompatibleLLM:
     def max_tokens_for(schema: type) -> int:
         # Review is the largest response and reasoning-capable providers may spend
         # completion tokens before producing message.content.
-        return 8192 if schema is AdversarialReview else 1500
+        return 8000 if schema is AdversarialReview else 1500
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -144,13 +144,18 @@ class OpenAICompatibleLLM:
         last_error: Exception | None = None
         input_tokens = 0
         output_tokens = 0
-        for attempt in range(self.max_retries + 1):
+        repair_pending = False
+        for attempt in range(
+            self.max_retries + 2 if schema is AdversarialReview else self.max_retries + 1
+        ):
+            is_repair = repair_pending
             body: dict = {
                 "model": model,
                 "messages": messages,
                 "temperature": 0,
-                "max_tokens": self.max_tokens_for(schema),
             }
+            token_field = "max_completion_tokens" if schema is AdversarialReview else "max_tokens"
+            body[token_field] = self.max_tokens_for(schema)
             if self.json_mode:
                 body["response_format"] = {"type": "json_object"}
             if (
@@ -210,6 +215,34 @@ class OpenAICompatibleLLM:
                     value = schema.model_validate_json(content)
                 except ValidationError as exc:
                     error_types = sorted({item["type"] for item in exc.errors()})
+                    if schema is AdversarialReview and not is_repair:
+                        try:
+                            invalid_object = json.loads(content)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            errors = exc.errors(
+                                include_input=False, include_context=False, include_url=False
+                            )
+                            messages = [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Correct the JSON object to match this schema: "
+                                        f"{schema_text}. Return only JSON; spend minimal reasoning."
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Correct this JSON object to match the schema. "
+                                        "Return only the corrected JSON object; do not redo the review.\n"
+                                        f"Invalid object: {json.dumps(invalid_object, ensure_ascii=False)}\n"
+                                        f"Schema validation errors: {json.dumps(errors, ensure_ascii=False)}"
+                                    ),
+                                },
+                            ]
+                            repair_pending = True
                     raise StructuredOutputError(
                         f"Completion failed schema validation: {', '.join(error_types)}"
                     ) from exc
@@ -227,15 +260,16 @@ class OpenAICompatibleLLM:
                     if isinstance(exc, ProviderOutputError)
                     else "invalid_response"
                 )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Previous output failed validation: {str(exc)[:300]}. "
-                            "Return a corrected JSON object only."
-                        ),
-                    }
-                )
+                if not repair_pending:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Previous output failed validation: {str(exc)[:300]}. "
+                                "Return a corrected JSON object only."
+                            ),
+                        }
+                    )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
                 outcome = "transport_failure"
@@ -252,8 +286,11 @@ class OpenAICompatibleLLM:
                     observer.finished(
                         attempt_id, outcome, attempt_input, attempt_output, diagnostics
                     )
-            if attempt < self.max_retries:
+            if is_repair:
+                break
+            if repair_pending or attempt < self.max_retries:
                 continue
+            break
         raise StructuredOutputError(
             f"Structured response failed after bounded retries: {last_error}",
             input_tokens,

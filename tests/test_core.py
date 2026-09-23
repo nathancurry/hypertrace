@@ -115,6 +115,10 @@ def test_structured_llm_retries_invalid_json_and_stops():
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 1500
+        assert "max_completion_tokens" not in body
+        assert "reasoning_effort" not in body
         content = '{"relevant": true, "reason": "ok"}' if calls == 2 else "not json"
         return httpx.Response(
             200,
@@ -777,7 +781,9 @@ def test_failed_review_resume_retries_without_duplicating_evidence(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        assert json.loads(request.content)["max_tokens"] == 8192
+        body = json.loads(request.content)
+        assert body["max_completion_tokens"] == 8000
+        assert "max_tokens" not in body
         content = "" if calls == 1 else '{"transmission_gaps": ["Unverified"], "next_queries": []}'
         return httpx.Response(
             200,
@@ -866,7 +872,8 @@ def test_live_provider_review_settings_and_truncation():
         nonlocal requests
         requests += 1
         body = json.loads(request.content)
-        assert body["max_tokens"] == 8192
+        assert body["max_completion_tokens"] == 8000
+        assert "max_tokens" not in body
         assert body["reasoning_effort"] == "low"
         return httpx.Response(
             200,
@@ -893,6 +900,88 @@ def test_live_provider_review_settings_and_truncation():
 
     asyncio.run(exercise())
     assert requests == 1
+
+
+def test_review_schema_failure_gets_one_correction_call():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        content = (
+            '{"overclaims": "unsupported"}'
+            if len(requests) == 1
+            else '{"overclaims": ["unsupported"]}'
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": content,
+                            "reasoning_content": '{"overclaims": ["wrong channel"]}',
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client, max_retries=2)
+            result = await llm.complete(
+                "review-model", "review instructions", "research context", AdversarialReview
+            )
+            assert result.value.overclaims == ["unsupported"]
+            assert (result.input_tokens, result.output_tokens) == (20, 10)
+
+    asyncio.run(exercise())
+    assert len(requests) == 2
+    assert all(body["max_completion_tokens"] == 8000 for body in requests)
+    assert all("reasoning_effort" not in body for body in requests)
+    repair = requests[1]["messages"]
+    assert len(repair) == 2
+    assert "research context" not in str(repair)
+    assert "Adversarially review" not in str(repair)
+    assert '"overclaims": "unsupported"' in repair[1]["content"]
+    assert "list_type" in repair[1]["content"]
+    assert "do not redo the review" in repair[1]["content"]
+
+
+def test_review_failed_after_invalid_repair_remains_due(tmp_path):
+    requests = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"overclaims": "still invalid"}'}}]},
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client, max_retries=2)
+            config = _config(tmp_path)
+            with Database(config.db_path) as db:
+                qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+                query_id = db.add_query(
+                    SearchQuery(research_question_id=qid, query="hyperpop origin")
+                )
+                db.mark_query_executed(query_id)
+                run_id = await Researcher(
+                    db, llm, FakeRetrieval(), config, qid, Limits(max_actions=2)
+                ).run()
+                run = db.rows("SELECT status,stop_reason FROM runs WHERE id=?", (run_id,))[0]
+                assert tuple(run) == ("stopped", "review_failed")
+                assert db.review_due(qid) == query_id
+                assert len(db.rows("SELECT * FROM review_attempts")) == 1
+                assert len(db.rows("SELECT * FROM provider_attempts")) == 2
+
+    asyncio.run(exercise())
+    assert requests == 2
 
 
 def test_provider_error_diagnostics_redact_credentials_and_response_text(caplog):

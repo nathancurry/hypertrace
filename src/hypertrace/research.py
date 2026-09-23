@@ -168,6 +168,8 @@ class Researcher:
                 + 1024
             )
             attempts = getattr(self.llm, "max_retries", 0) + 1
+            if provider_tracked and schema is AdversarialReview:
+                attempts += 1  # One possible schema correction request.
             max_output_tokens = self.llm.max_tokens_for(schema) if provider_tracked else 1500
             reserve = (
                 attempts

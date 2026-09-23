@@ -89,4 +89,6 @@ Return structured JSON only."""
 REVIEW_SYSTEM = """Adversarially review the persisted historical record. Find overclaims,
 weak dating, retroactive tagging, repeated secondary claims, missing transmission evidence,
 falsification paths, and high-value next searches. Never assume earliest observed means origin.
-Return structured JSON only."""
+Spend minimal reasoning and return the object promptly. Return concise JSON only, with no prose
+outside the schema. Use at most 3 short items in each concern or test list, and at most 5
+next_queries. Use empty lists when there is no supported finding."""
