@@ -96,8 +96,21 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     pending = db.rows(
-        "SELECT query,rationale FROM queries WHERE research_question_id=? AND executed_at IS NULL "
-        "ORDER BY id LIMIT 15",
+        "SELECT id,query,rationale,gap,information_value FROM queries WHERE research_question_id=? "
+        "AND status='active' ORDER BY priority DESC,id LIMIT 15",
+        (question_id,),
+    )
+    frontier_counts = {
+        row["status"]: row["count"]
+        for row in db.rows(
+            "SELECT status,COUNT(*) count FROM queries WHERE research_question_id=? "
+            "AND executed_at IS NULL GROUP BY status",
+            (question_id,),
+        )
+    }
+    deferred = db.rows(
+        "SELECT id,query,rationale FROM queries WHERE research_question_id=? AND status='deferred' "
+        "ORDER BY priority DESC,id LIMIT 10",
         (question_id,),
     )
     candidates = db.rows(
@@ -350,12 +363,34 @@ def markdown_report(db: Database, question_id: int) -> str:
         lines.extend(["", "## Archived overlapping proposals", ""])
         for note in overlaps:
             lines.append(f"- Former H{note['former_hypothesis_id']}: {_cell(note['statement'])}")
-    lines.extend(["", "## Suggested next searches", ""])
+    lines.extend(
+        [
+            "",
+            "## Research frontier",
+            "",
+            (
+                f"{frontier_counts.get('active', 0)} active queries; "
+                f"{frontier_counts.get('deferred', 0)} deferred leads; "
+                f"{frontier_counts.get('exhausted', 0)} exhausted queries; "
+                f"{frontier_counts.get('rejected_duplicate', 0)} rejected duplicates."
+            ),
+            "",
+            "### Active searches",
+            "",
+        ]
+    )
     if pending:
         for query in pending:
-            lines.append(f"- `{query['query']}` — {_cell(query['rationale'])}")
+            lines.append(
+                f"- Q{query['id']} `{query['query']}` [{query['information_value']}] — {_cell(query['gap'])}"
+            )
     else:
-        lines.append("- No pending searches recorded.")
+        lines.append("- No active searches recorded.")
+    lines.extend(["", "### Deferred leads", ""])
+    for query in deferred:
+        lines.append(f"- Q{query['id']} `{query['query']}` — {_cell(query['rationale'])}")
+    if not deferred:
+        lines.append("- No deferred leads recorded.")
     if candidates:
         lines.extend(["", "## Pending page candidates", ""])
         for candidate in candidates:

@@ -404,8 +404,9 @@ class Researcher:
         pending = [
             dict(row)
             for row in self.db.rows(
-                "SELECT id,query,rationale FROM queries WHERE research_question_id=? "
-                "AND executed_at IS NULL ORDER BY id LIMIT 10",
+                "SELECT id,query,rationale,gap,information_value,avenue FROM queries "
+                "WHERE research_question_id=? AND status='active' AND executed_at IS NULL "
+                "ORDER BY priority DESC,id LIMIT 10",
                 (self.question_id,),
             )
         ]
@@ -427,6 +428,15 @@ class Researcher:
                 (self.question_id,),
             )
         ]
+        avenues = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT avenue,COUNT(*) searches FROM queries WHERE research_question_id=? "
+                "AND status!='rejected_duplicate' AND avenue!='' GROUP BY avenue "
+                "ORDER BY MAX(id) DESC LIMIT 30",
+                (self.question_id,),
+            )
+        ]
         return {
             "question": q[0]["question"],
             "hypotheses": hypotheses,
@@ -435,6 +445,7 @@ class Researcher:
             "pending_queries": pending,
             "leads": leads,
             "failed_sources": failed_sources,
+            "avenues": avenues,
         }
 
     async def _plan(self) -> None:
@@ -453,6 +464,10 @@ class Researcher:
                     research_question_id=self.question_id,
                     query=item.query,
                     rationale=item.rationale,
+                    gap=item.gap,
+                    information_value=item.information_value,
+                    novelty=item.novelty,
+                    admission_basis=item.admission_basis,
                     generated_by=self.config.router_model,
                 )
                 for item in plan.queries
@@ -659,6 +674,10 @@ class Researcher:
                 research_question_id=self.question_id,
                 query=lead.query,
                 rationale=lead.rationale,
+                gap=lead.gap,
+                information_value=lead.information_value,
+                novelty=lead.novelty,
+                admission_basis=lead.admission_basis,
                 generated_by=self.model,
             )
             for lead in assessment.new_queries
@@ -743,11 +762,18 @@ class Researcher:
 
     async def _review(self, query_id: int) -> None:
         try:
+            context = self._context()
+            context["reviewed_query"] = dict(
+                self.db.rows(
+                    "SELECT id,query,avenue FROM queries WHERE id=? AND research_question_id=?",
+                    (query_id, self.question_id),
+                )[0]
+            )
             review: AdversarialReview = await self._complete(
                 "review",
                 self.config.review_model,
                 REVIEW_SYSTEM,
-                json.dumps(self._context(), ensure_ascii=False),
+                json.dumps(context, ensure_ascii=False),
                 AdversarialReview,
             )
         except BudgetStop as exc:
@@ -772,10 +798,15 @@ class Researcher:
                     research_question_id=self.question_id,
                     query=lead.query,
                     rationale=lead.rationale,
+                    gap=lead.gap,
+                    information_value=lead.information_value,
+                    novelty=lead.novelty,
+                    admission_basis=lead.admission_basis,
                     generated_by=self.config.review_model,
                 )
                 for lead in review.next_queries
             ],
+            [(item.avenue, item.reason) for item in review.exhausted_avenues],
         )
 
     async def run(self) -> int:

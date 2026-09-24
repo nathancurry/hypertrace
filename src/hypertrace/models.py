@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -114,6 +115,10 @@ class SearchQuery(BaseModel):
     generated_by: str = "model"
     created_at: str = Field(default_factory=utc_now)
     executed_at: str | None = None
+    gap: str = ""
+    information_value: str = "medium"
+    novelty: str = ""
+    admission_basis: str = "unresolved_gap"
 
 
 class Source(BaseModel):
@@ -192,6 +197,12 @@ class ResearchRun(BaseModel):
 class PlannedQuery(BaseModel):
     query: str = Field(min_length=2, max_length=500)
     rationale: str = Field(min_length=1)
+    gap: str = Field(min_length=3)
+    information_value: Literal["high", "medium", "low"]
+    novelty: str = Field(min_length=3)
+    admission_basis: Literal[
+        "unresolved_gap", "hypothesis_distinction", "primary_source", "new_avenue"
+    ]
 
 
 class QueryPlan(BaseModel):
@@ -248,6 +259,11 @@ class HypothesisScreen(BaseModel):
     overlapping_ids: list[int] = Field(default_factory=list)
 
 
+class AvenueRetirement(BaseModel):
+    avenue: str = Field(min_length=1)
+    reason: str = Field(min_length=3)
+
+
 class AdversarialReview(BaseModel):
     overclaims: list[str] = Field(default_factory=list, max_length=3)
     dating_concerns: list[str] = Field(default_factory=list, max_length=3)
@@ -255,3 +271,4 @@ class AdversarialReview(BaseModel):
     transmission_gaps: list[str] = Field(default_factory=list, max_length=3)
     falsification_tests: list[str] = Field(default_factory=list, max_length=3)
     next_queries: list[PlannedQuery] = Field(default_factory=list, max_length=5)
+    exhausted_avenues: list[AvenueRetirement] = Field(default_factory=list, max_length=5)

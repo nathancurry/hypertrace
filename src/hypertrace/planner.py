@@ -62,6 +62,11 @@ def seed_motivating_case(db: Database) -> int:
 PLAN_SYSTEM = """You plan historical provenance research. Propose a small, diverse set of searches
 that could distinguish competing hypotheses. Seek counterevidence. Prioritize dated primary
 sources, naming statements, and transmission paths. Earliest found is not earliest ever.
+For each query give gap (the unresolved question or hypothesis distinction),
+information_value (high/medium/low), novelty (how it differs from executed and pending
+searches), and admission_basis (unresolved_gap, hypothesis_distinction, primary_source,
+or new_avenue). Prefer the original source behind an attributed claim. Avoid paraphrases
+and retrospective recaps. Return no queries when the remaining avenues are exhausted.
 Return structured JSON only."""
 
 ASSESS_SYSTEM = """You extract source-grounded historical evidence. Use ONLY the fetched page
@@ -86,6 +91,10 @@ primary evidence of naming or borrowing. Do not call page metadata contemporary 
 uncertain, use low confidence and contemporaneous=null. Relationship hypothesis IDs must come from
 the supplied list. Record concrete people, publications, terms, dates, and citations as leads,
 and propose follow-up queries for them.
+For every new query give gap, information_value (high/medium/low), novelty relative to
+the existing frontier, and admission_basis (unresolved_gap, hypothesis_distinction,
+primary_source, or new_avenue). Seek the original text behind attributed claims first.
+Do not propose restatements of existing searches.
 Return structured JSON only."""
 
 INTERPRET_SYSTEM = """Interpret persisted evidence conservatively. Do not invent facts.
@@ -110,4 +119,9 @@ weak dating, retroactive tagging, repeated secondary claims, missing transmissio
 falsification paths, and high-value next searches. Never assume earliest observed means origin.
 Spend minimal reasoning and return the object promptly. Return concise JSON only, with no prose
 outside the schema. Use at most 3 short items in each concern or test list, and at most 5
-next_queries. Use empty lists when there is no supported finding."""
+next_queries. Each query needs gap, information_value (high/medium/low), novelty
+relative to prior searches, and admission_basis (unresolved_gap, hypothesis_distinction,
+primary_source, or new_avenue). Prefer original sources behind attributed claims.
+List existing avenue keys and a concrete reason in exhausted_avenues only when adequately
+answered or repeated searches produced no evidence. Use empty lists when there is no
+supported finding."""

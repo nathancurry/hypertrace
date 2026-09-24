@@ -1121,10 +1121,15 @@ def test_candidate_and_review_commits_roll_back_on_interruption(tmp_path, monkey
         )
         assert db.pending_candidate(qid) is None
         run_id = db.start_run(ResearchRun(research_question_id=qid, model="model", provider="test"))
-        next_query = SearchQuery(research_question_id=qid, query="older hyperpop use")
+        next_query = SearchQuery(
+            research_question_id=qid,
+            query="older hyperpop use",
+            gap="Earlier usage remains undated",
+            novelty="Searches an older period",
+        )
         with monkeypatch.context() as patch:
             patch.setattr(
-                db, "_add_query_tx", lambda _: (_ for _ in ()).throw(RuntimeError("crash"))
+                db, "_add_query_tx", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("crash"))
             )
             with pytest.raises(RuntimeError, match="crash"):
                 db.persist_review(run_id, qid, query_id, "{}", [next_query])

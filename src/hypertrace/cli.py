@@ -31,6 +31,9 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--max-minutes", type=float, default=20)
     run.add_argument("--min-yield", type=float)
     run.add_argument("--model")
+    activate = sub.add_parser("activate-query", help="Reconsider a deferred query")
+    activate.add_argument("query_id", type=int)
+    activate.add_argument("--question-id", type=int)
     for name in ("status", "evidence", "hypotheses", "report"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--question-id", type=int)
@@ -88,6 +91,12 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Created question {qid}")
             return
         qid = _question_id(db, args.question_id)
+        if args.command == "activate-query":
+            activated = db.activate_deferred_query(qid, args.query_id)
+            print(
+                "Activated deferred query" if activated else "Active frontier has higher priorities"
+            )
+            return
         if args.command == "run":
             run_id = asyncio.run(_run(db, config, args, qid))
             row = db.rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
@@ -104,16 +113,21 @@ def main(argv: list[str] | None = None) -> None:
                 "SELECT (SELECT COUNT(*) FROM hypotheses "
                 "WHERE research_question_id=? AND archived_at IS NULL) h,"
                 "(SELECT COUNT(*) FROM evidence WHERE research_question_id=?) e,"
-                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND executed_at IS NULL) q,"
+                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND status='active') active,"
+                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND status='deferred') deferred,"
+                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND status='exhausted') exhausted,"
+                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND status='rejected_duplicate') duplicates,"
                 "(SELECT COUNT(*) FROM candidates c JOIN queries q ON q.id=c.query_id "
                 "WHERE q.research_question_id=? AND c.assessed_at IS NULL "
                 "AND c.failure_at IS NULL) c",
-                (qid, qid, qid, qid),
+                (qid, qid, qid, qid, qid, qid, qid),
             )[0]
             print(f"Question {qid} [{q['status']}]: {q['question']}")
             print(
                 f"{counts['h']} hypotheses; {counts['e']} evidence; "
-                f"{counts['q']} pending queries; {counts['c']} pending pages"
+                f"{counts['active']} active queries; {counts['deferred']} deferred leads; "
+                f"{counts['exhausted']} exhausted queries; "
+                f"{counts['duplicates']} rejected duplicates; {counts['c']} pending pages"
             )
             runs = db.rows(
                 "SELECT * FROM runs WHERE research_question_id=? ORDER BY id DESC LIMIT 1", (qid,)
