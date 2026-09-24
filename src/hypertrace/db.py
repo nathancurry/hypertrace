@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS hypotheses (
   statement TEXT NOT NULL, status TEXT NOT NULL, rationale TEXT NOT NULL,
   created_at TEXT NOT NULL, UNIQUE(research_question_id, statement)
 );
+CREATE TABLE IF NOT EXISTS research_notes (
+  id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
+  former_hypothesis_id INTEGER NOT NULL UNIQUE REFERENCES hypotheses(id),
+  kind TEXT NOT NULL CHECK(kind IN ('lead','gap','reliability','adjudication','overlap')),
+  statement TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS queries (
   id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
   query TEXT NOT NULL, rationale TEXT NOT NULL, generated_by TEXT NOT NULL,
@@ -177,6 +183,7 @@ class Database:
 
     def _migrate(self) -> None:
         additions = {
+            "hypotheses": {"archived_at": "TEXT"},
             "sources": {
                 "page_publication_date": "TEXT",
                 "regions_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -300,6 +307,47 @@ class Database:
             (hypothesis.research_question_id, hypothesis.statement),
         ).fetchone()
         return int(row["id"])
+
+    def reclassify_hypotheses(self, question_id: int, kinds: dict[int, str]) -> None:
+        """Move legacy proposals into typed notes while retaining all historical links."""
+        allowed = {"lead", "gap", "reliability", "adjudication", "overlap"}
+        if set(kinds.values()) - allowed:
+            raise ValueError("Unknown research note kind")
+        with self.conn:
+            for hypothesis_id, kind in kinds.items():
+                row = self.conn.execute(
+                    "SELECT * FROM hypotheses WHERE id=? AND research_question_id=?",
+                    (hypothesis_id, question_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"H{hypothesis_id} does not belong to question {question_id}")
+                existing = self.conn.execute(
+                    "SELECT kind FROM research_notes WHERE former_hypothesis_id=?",
+                    (hypothesis_id,),
+                ).fetchone()
+                if existing:
+                    if existing["kind"] != kind:
+                        raise ValueError(
+                            f"H{hypothesis_id} already classified as {existing['kind']}"
+                        )
+                    continue
+                self.conn.execute(
+                    "INSERT INTO research_notes "
+                    "(research_question_id,former_hypothesis_id,kind,statement,rationale,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        question_id,
+                        hypothesis_id,
+                        kind,
+                        row["statement"],
+                        row["rationale"],
+                        row["created_at"],
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE hypotheses SET archived_at=? WHERE id=?",
+                    (utc_now(), hypothesis_id),
+                )
 
     def add_query(self, query: SearchQuery) -> int:
         with self.conn:
@@ -684,7 +732,8 @@ class Database:
             (evidence_id,),
         ).fetchone()
         hypothesis = self.conn.execute(
-            "SELECT research_question_id FROM hypotheses WHERE id=?", (hypothesis_id,)
+            "SELECT research_question_id FROM hypotheses WHERE id=? AND archived_at IS NULL",
+            (hypothesis_id,),
         ).fetchone()
         if evidence is None or hypothesis is None or evidence[0] != hypothesis[0]:
             raise ValueError("Relationship records must belong to the same research question")
@@ -817,6 +866,12 @@ class Database:
         question_id: int,
     ) -> None:
         if not evidence_ids:
+            return
+        if not self.rows(
+            "SELECT id FROM hypotheses WHERE id=? AND research_question_id=? "
+            "AND archived_at IS NULL",
+            (hypothesis_id, question_id),
+        ):
             return
         placeholders = ",".join("?" for _ in evidence_ids)
         rows = self.rows(

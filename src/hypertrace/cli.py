@@ -101,7 +101,8 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "status":
             q = db.rows("SELECT * FROM questions WHERE id=?", (qid,))[0]
             counts = db.rows(
-                "SELECT (SELECT COUNT(*) FROM hypotheses WHERE research_question_id=?) h,"
+                "SELECT (SELECT COUNT(*) FROM hypotheses "
+                "WHERE research_question_id=? AND archived_at IS NULL) h,"
                 "(SELECT COUNT(*) FROM evidence WHERE research_question_id=?) e,"
                 "(SELECT COUNT(*) FROM queries WHERE research_question_id=? AND executed_at IS NULL) q,"
                 "(SELECT COUNT(*) FROM candidates c JOIN queries q ON q.id=c.query_id "
@@ -136,7 +137,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
         elif args.command == "hypotheses":
             for row in db.rows(
-                "SELECT * FROM hypotheses WHERE research_question_id=? ORDER BY id", (qid,)
+                "SELECT * FROM hypotheses WHERE research_question_id=? "
+                "AND archived_at IS NULL ORDER BY id",
+                (qid,),
             ):
                 print(f"H{row['id']} [{row['status']}] {row['statement']}\n  {row['rationale']}")
         elif args.command == "report":

@@ -242,6 +242,12 @@ class Interpretation(BaseModel):
     new_hypotheses: list[str] = Field(default_factory=list, max_length=2)
 
 
+class HypothesisScreen(BaseModel):
+    explanatory: bool
+    relevant: bool
+    overlapping_ids: list[int] = Field(default_factory=list)
+
+
 class AdversarialReview(BaseModel):
     overclaims: list[str] = Field(default_factory=list, max_length=3)
     dating_concerns: list[str] = Field(default_factory=list, max_length=3)

@@ -19,6 +19,7 @@ from hypertrace.models import (
     AdversarialReview,
     Evidence,
     Hypothesis,
+    HypothesisScreen,
     Interpretation,
     PageAssessment,
     QueryPlan,
@@ -28,7 +29,13 @@ from hypertrace.models import (
     SearchQuery,
     Source,
 )
-from hypertrace.planner import ASSESS_SYSTEM, INTERPRET_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM
+from hypertrace.planner import (
+    ASSESS_SYSTEM,
+    INTERPRET_SYSTEM,
+    PLAN_SYSTEM,
+    REVIEW_SYSTEM,
+    SCREEN_SYSTEM,
+)
 from hypertrace.retrieval.base import FetchFailure, Retrieval
 
 
@@ -80,6 +87,19 @@ SEARCH_STOPWORDS = {
     "with",
     "would",
 }
+
+_NON_HYPOTHESIS = re.compile(
+    r"\b(?:find|locate|locating|retrieve|search|seek|verify|verification|"
+    r"check|access|trace|tracing|prioritize|"
+    r"should be sought|should be accessed|should be verified|remains unchecked|"
+    r"would test|would adjudicate|source reliability|primary sources|"
+    r"targeted search|unresolved|unverified source)\b",
+    re.IGNORECASE,
+)
+
+
+def _hypothesis_key(statement: str) -> str:
+    return " ".join(re.findall(r"[\w]+", statement.casefold()))
 
 
 def _relevance_windows(
@@ -356,7 +376,8 @@ class Researcher:
         hypotheses = [
             dict(row)
             for row in self.db.rows(
-                "SELECT id,statement,status,rationale FROM hypotheses WHERE research_question_id=?",
+                "SELECT id,statement,status,rationale FROM hypotheses "
+                "WHERE research_question_id=? AND archived_at IS NULL ORDER BY id",
                 (self.question_id,),
             )
         ]
@@ -682,14 +703,43 @@ class Researcher:
                     self.question_id,
                 )
         for statement in interpretation.new_hypotheses:
-            if statement.strip():
-                self.db.add_hypothesis(
-                    Hypothesis(
-                        research_question_id=self.question_id,
-                        statement=statement.strip(),
-                        rationale="Proposed during interpretation.",
-                    )
+            statement = statement.strip()
+            if not statement or _NON_HYPOTHESIS.search(statement):
+                continue
+            existing = self.db.rows(
+                "SELECT id,statement FROM hypotheses WHERE research_question_id=?",
+                (self.question_id,),
+            )
+            if len(context["hypotheses"]) >= 8 or _hypothesis_key(statement) in {
+                _hypothesis_key(row["statement"]) for row in existing
+            }:
+                continue
+            screen: HypothesisScreen = await self._complete(
+                "screen_hypothesis",
+                self.model,
+                SCREEN_SYSTEM,
+                json.dumps(
+                    {
+                        "question": context["question"],
+                        "existing_hypotheses": context["hypotheses"],
+                        "proposal": statement,
+                    },
+                    ensure_ascii=False,
+                ),
+                HypothesisScreen,
+            )
+            if not screen.explanatory or not screen.relevant or screen.overlapping_ids:
+                continue
+            hypothesis_id = self.db.add_hypothesis(
+                Hypothesis(
+                    research_question_id=self.question_id,
+                    statement=statement,
+                    rationale="Proposed during interpretation; passed explanatory relevance and overlap screen.",
                 )
+            )
+            context["hypotheses"].append(
+                {"id": hypothesis_id, "statement": statement, "status": "open"}
+            )
 
     async def _review(self, query_id: int) -> None:
         try:

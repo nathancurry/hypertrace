@@ -27,7 +27,8 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     hypotheses = db.rows(
-        "SELECT * FROM hypotheses WHERE research_question_id=? ORDER BY id", (question_id,)
+        "SELECT * FROM hypotheses WHERE research_question_id=? AND archived_at IS NULL ORDER BY id",
+        (question_id,),
     )
     evidence = db.rows(
         "SELECT e.*,s.canonical_url,s.retrieved_url,s.title,s.page_publication_date,s.dating_notes,"
@@ -75,7 +76,8 @@ def markdown_report(db: Database, question_id: int) -> str:
             seen_quotes.add(key)
     relationships = db.rows(
         "SELECT r.* FROM relationships r JOIN evidence e ON e.id=r.evidence_id "
-        "WHERE e.research_question_id=?",
+        "JOIN hypotheses h ON h.id=r.hypothesis_id "
+        "WHERE e.research_question_id=? AND h.archived_at IS NULL",
         (question_id,),
     )
     links: dict[int, list] = {}
@@ -89,7 +91,8 @@ def markdown_report(db: Database, question_id: int) -> str:
     suggestions = db.rows(
         "SELECT h.id hypothesis_id,s.proposed_status,s.rationale,s.evidence_ids_json "
         "FROM hypothesis_suggestions s JOIN hypotheses h ON h.id=s.hypothesis_id "
-        "WHERE h.research_question_id=? ORDER BY s.id DESC LIMIT 20",
+        "WHERE h.research_question_id=? AND h.archived_at IS NULL "
+        "ORDER BY s.id DESC LIMIT 20",
         (question_id,),
     )
     pending = db.rows(
@@ -114,6 +117,11 @@ def markdown_report(db: Database, question_id: int) -> str:
         "SELECT l.kind,l.value,l.rationale,s.retrieved_url,s.title,s.id source_id "
         "FROM leads l JOIN sources s ON s.id=l.source_id "
         "WHERE l.research_question_id=? ORDER BY l.id DESC LIMIT 30",
+        (question_id,),
+    )
+    notes = db.rows(
+        "SELECT former_hypothesis_id,kind,statement FROM research_notes "
+        "WHERE research_question_id=? ORDER BY former_hypothesis_id",
         (question_id,),
     )
     lines = [f"# Research report: {question['question']}", "", "## Current conclusion", ""]
@@ -307,7 +315,15 @@ def markdown_report(db: Database, question_id: int) -> str:
             gaps.extend(review.get(key, []))
     for gap in dict.fromkeys(gaps):
         lines.append(f"- {_cell(gap)}")
-    if not gaps:
+    for note in notes:
+        if note["kind"] in {"gap", "reliability", "adjudication"}:
+            lines.append(
+                f"- Former H{note['former_hypothesis_id']} [{note['kind']}]: "
+                f"{_cell(note['statement'])}"
+            )
+    if not gaps and not any(
+        note["kind"] in {"gap", "reliability", "adjudication"} for note in notes
+    ):
         if reviews:
             lines.append(
                 "- Reviews recorded no explicit gaps; publication dating and source independence still require verification."
@@ -324,6 +340,16 @@ def markdown_report(db: Database, question_id: int) -> str:
                 f"{_cell(lead['rationale'])}. "
                 f"{_cite(lead['retrieved_url'], lead['title'], lead['source_id'])}"
             )
+    research_leads = [note for note in notes if note["kind"] == "lead"]
+    if research_leads:
+        lines.extend(["", "## Research leads", ""])
+        for note in research_leads:
+            lines.append(f"- Former H{note['former_hypothesis_id']}: {_cell(note['statement'])}")
+    overlaps = [note for note in notes if note["kind"] == "overlap"]
+    if overlaps:
+        lines.extend(["", "## Archived overlapping proposals", ""])
+        for note in overlaps:
+            lines.append(f"- Former H{note['former_hypothesis_id']}: {_cell(note['statement'])}")
     lines.extend(["", "## Suggested next searches", ""])
     if pending:
         for query in pending:

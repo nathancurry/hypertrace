@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from dataclasses import replace
 
 import httpx
@@ -19,6 +20,7 @@ from hypertrace.models import (
     ContentRegion,
     Evidence,
     Hypothesis,
+    HypothesisScreen,
     Interpretation,
     PageAssessment,
     QuoteRegion,
@@ -60,6 +62,7 @@ def test_persistence_provenance_and_revision_integrity(tmp_path):
         metadata_revision = first.model_copy(
             update={"document_hash": "a" * 64, "page_publication_date": "2001-01-01"}
         )
+
         assert db.add_source(metadata_revision) != first_id
         with pytest.raises(ValueError, match="hash"):
             db.add_source(first.model_copy(update={"content_hash": "wrong"}))
@@ -119,6 +122,132 @@ def test_persistence_provenance_and_revision_integrity(tmp_path):
             db.rows("SELECT discovered_by_query_id FROM evidence WHERE id=?", (evidence_id,))[0][0]
             == query
         )
+
+
+@pytest.mark.parametrize(
+    ("proposal", "screen", "accepted"),
+    [
+        ("Find the 2014 Pitchfork article.", None, False),
+        ("Wikipedia remains unchecked and should be accessed.", None, False),
+        (
+            "The modern term arose independently within PC Music discourse.",
+            {"explanatory": True, "relevant": True, "overlapping_ids": []},
+            True,
+        ),
+        (
+            "Björk's Hyperballad gave modern hyperpop its name.",
+            {"explanatory": True, "relevant": True, "overlapping_ids": [1]},
+            False,
+        ),
+        (
+            "Modern hyperpop terminology was derived from Björk's Hyperballad.",
+            {"explanatory": True, "relevant": True, "overlapping_ids": [1]},
+            False,
+        ),
+    ],
+)
+def test_interpretation_hypothesis_gate(tmp_path, proposal, screen, accepted):
+    class ProposalLLM(FakeLLM):
+        def __init__(self):
+            self.screen_calls = 0
+
+        async def complete(self, model, system, user, schema):
+            if schema is Interpretation:
+                return LLMResult(value=Interpretation(new_hypotheses=[proposal]))
+            if schema is HypothesisScreen:
+                self.screen_calls += 1
+                return LLMResult(value=HypothesisScreen.model_validate(screen))
+            raise AssertionError(schema)
+
+    with Database(tmp_path / "db.sqlite") as db:
+        qid = db.add_question(ResearchQuestion(question="Did the modern term borrow its name?"))
+        db.add_hypothesis(
+            Hypothesis(
+                research_question_id=qid,
+                statement="Björk's Hyperballad gave modern hyperpop its name.",
+            )
+        )
+        sid = db.add_source(_source("https://example.org/a", "The term appears here."))
+        db.add_evidence(
+            Evidence(
+                source_id=sid,
+                research_question_id=qid,
+                exact_quote="The term appears here.",
+                normalized_claim="The term appears here.",
+                evidence_type="observed_usage",
+            )
+        )
+        llm = ProposalLLM()
+        researcher = Researcher(
+            db, llm, FakeRetrieval(), _config(tmp_path), qid, Limits(max_actions=10, max_minutes=1)
+        )
+        researcher.deadline = time.monotonic() + 60
+        researcher.run_id = db.start_run(
+            ResearchRun(research_question_id=qid, model="test", provider="test")
+        )
+        asyncio.run(researcher._interpret())
+        active = db.rows(
+            "SELECT statement FROM hypotheses WHERE research_question_id=? AND archived_at IS NULL",
+            (qid,),
+        )
+        assert (len(active) == 2) == accepted
+        assert llm.screen_calls == (1 if screen and proposal != active[0]["statement"] else 0)
+
+
+def test_hypothesis_reclassification_is_atomic_and_preserves_history(tmp_path):
+    path = tmp_path / "db.sqlite"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did the term originate?"))
+        retained = db.add_hypothesis(
+            Hypothesis(research_question_id=qid, statement="It arose independently.")
+        )
+        lead = db.add_hypothesis(
+            Hypothesis(research_question_id=qid, statement="Find the primary article.")
+        )
+        gap = db.add_hypothesis(
+            Hypothesis(research_question_id=qid, statement="Article inaccessible.")
+        )
+        sid = db.add_source(_source("https://example.org/a", "The term appears here."))
+        eid = db.add_evidence(
+            Evidence(
+                source_id=sid,
+                research_question_id=qid,
+                exact_quote="The term appears here.",
+                normalized_claim="The term appears here.",
+                evidence_type="observed_usage",
+            )
+        )
+        db.add_relationship(eid, lead, "contextualizes", "Historical link")
+        run_id = db.start_run(ResearchRun(research_question_id=qid, model="test", provider="test"))
+        db.add_hypothesis_suggestion(run_id, lead, "open", "Historical suggestion", [eid], qid)
+        with pytest.raises(ValueError, match="does not belong"):
+            db.reclassify_hypotheses(qid, {lead: "lead", 99999: "gap"})
+        assert not db.rows("SELECT id FROM research_notes")
+        db.reclassify_hypotheses(qid, {lead: "lead", gap: "gap"})
+        db.reclassify_hypotheses(qid, {lead: "lead", gap: "gap"})
+    with Database(path) as db:
+        assert [
+            r["id"] for r in db.rows("SELECT id FROM hypotheses WHERE archived_at IS NULL")
+        ] == [retained]
+        assert [
+            (r["former_hypothesis_id"], r["kind"])
+            for r in db.rows(
+                "SELECT former_hypothesis_id,kind FROM research_notes ORDER BY former_hypothesis_id"
+            )
+        ] == [(lead, "lead"), (gap, "gap")]
+        assert db.rows("SELECT id FROM relationships WHERE hypothesis_id=?", (lead,))
+        assert db.rows("SELECT id FROM hypothesis_suggestions WHERE hypothesis_id=?", (lead,))
+        note = db.rows(
+            "SELECT statement,rationale,created_at FROM research_notes WHERE former_hypothesis_id=?",
+            (lead,),
+        )[0]
+        original = db.rows(
+            "SELECT statement,rationale,created_at FROM hypotheses WHERE id=?", (lead,)
+        )[0]
+        assert tuple(note) == tuple(original)
+        report = markdown_report(db, qid)
+        assert "H1" in report and "Former H2" in report and "Former H3" in report
+        assert "**H2" not in report
 
 
 def test_structured_llm_retries_invalid_json_and_stops():

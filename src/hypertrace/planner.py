@@ -92,7 +92,18 @@ INTERPRET_SYSTEM = """Interpret persisted evidence conservatively. Do not invent
 Chronology does not prove transmission, and a lack of found evidence does not disprove influence.
 Consider all contradictory evidence supplied. Statuses and rationales are provisional suggestions;
 every update must cite supporting evidence IDs. Use only supplied hypothesis IDs.
+Propose a new hypothesis only for a falsifiable explanation of the root question that is
+meaningfully distinct from existing hypotheses. Searches, missing sources, reliability concerns,
+and questions for adjudication are not hypotheses; leave them to planning and review.
 Return structured JSON only."""
+
+SCREEN_SYSTEM = """Screen one proposed hypothesis against the root research question and the
+existing active hypotheses. An explanatory hypothesis is a falsifiable proposition about why or
+how the subject of the root question arose. Observations, source gaps, source quality concerns,
+search instructions, and adjudication questions are not explanatory hypotheses. Mark relevant
+only if the proposition addresses the root question. List IDs whose explanations substantially
+overlap the proposal, including paraphrases and narrower versions of the same claim. Preserve
+substantively different explanations. When uncertain, reject. Return structured JSON only."""
 
 REVIEW_SYSTEM = """Adversarially review the persisted historical record. Find overclaims,
 weak dating, retroactive tagging, repeated secondary claims, missing transmission evidence,
