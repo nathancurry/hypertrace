@@ -384,6 +384,8 @@ class BraveWeb:
             author=author,
             page_publication_date=publication_date,
             source_type=source_type,
+            http_status=response.status_code,
+            redirect_history=redirects[:-1],
             content_hash=hashlib.sha256(content.encode()).hexdigest(),
             document_hash=hashlib.sha256(raw).hexdigest(),
             content=content,

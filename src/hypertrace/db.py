@@ -10,6 +10,7 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 from typing import Self
+from urllib.parse import urlsplit
 
 from hypertrace.frontier import (
     TARGET_ACTIVE_LIMIT,
@@ -35,6 +36,8 @@ from hypertrace.models import (
     TermSense,
     utc_now,
 )
+from hypertrace.retrieval.wayback import Snapshot
+from hypertrace.retrieval.web import canonicalize_url
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -60,6 +63,18 @@ CREATE TABLE IF NOT EXISTS source_targets (
   status TEXT NOT NULL DEFAULT 'unresolved' CHECK(status IN ('unresolved','resolved')),
   UNIQUE(research_question_id,key)
 );
+CREATE TABLE IF NOT EXISTS archive_targets (
+  id INTEGER PRIMARY KEY, source_target_id INTEGER NOT NULL REFERENCES source_targets(id),
+  original_url TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+  start_year INTEGER, end_year INTEGER, start_date TEXT, end_date TEXT,
+  UNIQUE(source_target_id,original_url)
+);
+CREATE TABLE IF NOT EXISTS archive_lookups (
+  id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
+  query_id INTEGER NOT NULL REFERENCES queries(id), original_url TEXT NOT NULL,
+  status TEXT NOT NULL, detail TEXT NOT NULL, attempted_at TEXT NOT NULL,
+  UNIQUE(research_question_id,original_url)
+);
 CREATE TABLE IF NOT EXISTS queries (
   id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
   query TEXT NOT NULL, rationale TEXT NOT NULL, generated_by TEXT NOT NULL,
@@ -82,6 +97,8 @@ CREATE TABLE IF NOT EXISTS sources (
   title TEXT NOT NULL, author TEXT, publication_date TEXT,
   page_publication_date TEXT, retrieval_date TEXT NOT NULL,
   source_type TEXT NOT NULL, archive_url TEXT, content_hash TEXT NOT NULL,
+  original_url TEXT, resolved_original_url TEXT, archive_timestamp TEXT,
+  http_status INTEGER, redirect_history_json TEXT NOT NULL DEFAULT '[]',
   document_hash TEXT NOT NULL,
   content TEXT NOT NULL, regions_json TEXT NOT NULL DEFAULT '[]', dating_notes TEXT NOT NULL,
   UNIQUE(canonical_url, document_hash, content_hash)
@@ -92,6 +109,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   assessed_at TEXT, fetch_error TEXT, failure_at TEXT, assessment_error TEXT,
   fetch_status INTEGER, fetch_final_url TEXT, fetch_redirects_json TEXT,
   fetch_retryable INTEGER CHECK(fetch_retryable IN (0,1)),
+  original_url TEXT, resolved_original_url TEXT, archive_timestamp TEXT,
   assessment_mode TEXT CHECK(assessment_mode IN ('full_document','relevance_windows')),
   UNIQUE(query_id, url)
 );
@@ -244,6 +262,11 @@ class Database:
             "sources": {
                 "page_publication_date": "TEXT",
                 "regions_json": "TEXT NOT NULL DEFAULT '[]'",
+                "original_url": "TEXT",
+                "resolved_original_url": "TEXT",
+                "archive_timestamp": "TEXT",
+                "http_status": "INTEGER",
+                "redirect_history_json": "TEXT NOT NULL DEFAULT '[]'",
             },
             "candidates": {
                 "failure_at": "TEXT",
@@ -253,6 +276,9 @@ class Database:
                 "fetch_final_url": "TEXT",
                 "fetch_redirects_json": "TEXT",
                 "fetch_retryable": "INTEGER",
+                "original_url": "TEXT",
+                "resolved_original_url": "TEXT",
+                "archive_timestamp": "TEXT",
             },
             "evidence": {
                 "quote_region": "TEXT NOT NULL DEFAULT 'unknown'",
@@ -834,6 +860,126 @@ class Database:
                 (query_id, url, title),
             )
 
+    def add_archive_target(
+        self,
+        question_id: int,
+        key: str,
+        url: str,
+        title: str = "",
+        start_year: int | None = None,
+        end_year: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> None:
+        url = canonicalize_url(url)
+        if start_year and end_year and end_year < start_year:
+            raise ValueError("Archive target end year precedes start year")
+        first = date.fromisoformat(start_date) if start_date else None
+        last = date.fromisoformat(end_date) if end_date else None
+        if first and last and last < first:
+            raise ValueError("Archive target end date precedes start date")
+        with self.conn:
+            target = self.conn.execute(
+                "SELECT id FROM source_targets WHERE research_question_id=? AND key=? "
+                "AND status='unresolved'",
+                (question_id, key),
+            ).fetchone()
+            if target is None:
+                raise ValueError("Unknown or resolved source target")
+            self.conn.execute(
+                "INSERT INTO archive_targets "
+                "(source_target_id,original_url,title,start_year,end_year,start_date,end_date) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(source_target_id,original_url) DO UPDATE SET "
+                "title=CASE WHEN excluded.title!='' THEN excluded.title ELSE archive_targets.title END,"
+                "start_year=COALESCE(excluded.start_year,archive_targets.start_year),"
+                "end_year=COALESCE(excluded.end_year,archive_targets.end_year),"
+                "start_date=COALESCE(excluded.start_date,archive_targets.start_date),"
+                "end_date=COALESCE(excluded.end_date,archive_targets.end_date)",
+                (target["id"], url, title, start_year, end_year, start_date, end_date),
+            )
+
+    def next_archive_lookup(self, question_id: int) -> dict | None:
+        targets = self.conn.execute(
+            "SELECT a.original_url,a.title,a.start_year,a.end_year,a.start_date,a.end_date,"
+            "MIN(q.id) query_id "
+            "FROM archive_targets a JOIN source_targets t ON t.id=a.source_target_id "
+            "JOIN queries q ON q.source_target_id=t.id "
+            "WHERE t.research_question_id=? AND t.status='unresolved' "
+            "GROUP BY a.id ORDER BY a.id",
+            (question_id,),
+        ).fetchall()
+        failed = self.conn.execute(
+            "SELECT c.url original_url,c.title,q.id query_id,a.start_year,a.end_year,"
+            "a.start_date,a.end_date,"
+            "a.original_url target_url "
+            "FROM candidates c JOIN queries q ON q.id=c.query_id "
+            "JOIN archive_targets a ON a.source_target_id=q.source_target_id "
+            "WHERE q.research_question_id=? AND q.source_target_id IS NOT NULL "
+            "AND c.failure_at IS NOT NULL AND c.original_url IS NULL ORDER BY c.id",
+            (question_id,),
+        ).fetchall()
+        for row in [*targets, *failed]:
+            item = dict(row)
+            try:
+                url = canonicalize_url(item["original_url"])
+            except ValueError:
+                continue
+            if urlsplit(url).hostname == "web.archive.org":
+                continue
+            if "target_url" in item and urlsplit(url).path.rstrip("/") != urlsplit(
+                item["target_url"]
+            ).path.rstrip("/"):
+                continue
+            if self.conn.execute(
+                "SELECT 1 FROM archive_lookups WHERE research_question_id=? AND original_url=?",
+                (question_id, url),
+            ).fetchone():
+                continue
+            return item | {"original_url": url}
+        return None
+
+    def record_archive_lookup(
+        self,
+        question_id: int,
+        query_id: int,
+        original_url: str,
+        snapshots: list[Snapshot],
+        detail: str,
+    ) -> None:
+        with self.conn:
+            query = self.conn.execute(
+                "SELECT research_question_id FROM queries WHERE id=?", (query_id,)
+            ).fetchone()
+            if query is None or query["research_question_id"] != question_id:
+                raise ValueError("Archive lookup query must belong to the question")
+            self.conn.execute(
+                "INSERT INTO archive_lookups "
+                "(research_question_id,query_id,original_url,status,detail,attempted_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    question_id,
+                    query_id,
+                    original_url,
+                    "snapshots" if snapshots else "gap",
+                    detail,
+                    utc_now(),
+                ),
+            )
+            for snapshot in snapshots:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO candidates "
+                    "(query_id,url,title,original_url,resolved_original_url,archive_timestamp) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        query_id,
+                        snapshot.url,
+                        "Archived snapshot",
+                        original_url,
+                        snapshot.original_url,
+                        snapshot.timestamp,
+                    ),
+                )
+
     def persist_plan(self, question_id: int, queries: list[SearchQuery]) -> None:
         with self.conn:
             for query in queries:
@@ -980,16 +1126,32 @@ class Database:
         for region in source.content_regions:
             if not 0 <= region.start < region.end <= len(source.content):
                 raise ValueError("Source region lies outside stored text")
-        values = source.model_dump(exclude={"id", "content_regions"}, mode="json")
-        values["regions_json"] = json.dumps(
-            [region.model_dump(mode="json") for region in source.content_regions]
-        )
         self.conn.execute(
             "INSERT OR IGNORE INTO sources "
             "(canonical_url,retrieved_url,title,author,page_publication_date,retrieval_date,"
-            "source_type,archive_url,content_hash,document_hash,content,dating_notes,regions_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            tuple(values.values()),
+            "source_type,archive_url,content_hash,document_hash,content,dating_notes,regions_json,"
+            "original_url,resolved_original_url,archive_timestamp,http_status,redirect_history_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                source.canonical_url,
+                source.retrieved_url,
+                source.title,
+                source.author,
+                source.page_publication_date,
+                source.retrieval_date,
+                source.source_type,
+                source.archive_url,
+                source.content_hash,
+                source.document_hash,
+                source.content,
+                source.dating_notes,
+                json.dumps([r.model_dump(mode="json") for r in source.content_regions]),
+                source.original_url,
+                source.resolved_original_url,
+                source.archive_timestamp,
+                source.http_status,
+                json.dumps(source.redirect_history),
+            ),
         )
         row = self.conn.execute(
             "SELECT id FROM sources WHERE canonical_url=? AND document_hash=? AND content_hash=?",

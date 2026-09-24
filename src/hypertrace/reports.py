@@ -33,14 +33,20 @@ def markdown_report(db: Database, question_id: int) -> str:
     )
     evidence = db.rows(
         "SELECT e.*,s.canonical_url,s.retrieved_url,s.title,s.page_publication_date,s.dating_notes,"
-        "s.author,s.retrieval_date,s.content_hash,s.document_hash,s.source_type FROM evidence e "
-        "JOIN sources s ON s.id=e.source_id WHERE e.research_question_id=? "
+        "s.author,s.retrieval_date,s.content_hash,s.document_hash,s.source_type,"
+        "s.original_url,s.resolved_original_url,s.archive_timestamp,s.archive_url,"
+        "s.http_status,s.redirect_history_json,t.key source_target FROM evidence e "
+        "JOIN sources s ON s.id=e.source_id "
+        "LEFT JOIN queries q ON q.id=e.discovered_by_query_id "
+        "LEFT JOIN source_targets t ON t.id=q.source_target_id "
+        "WHERE e.research_question_id=? "
         "ORDER BY e.quote_verified_date IS NULL,e.quote_verified_date,e.id",
         (question_id,),
     )
     source_captures = db.rows(
         "SELECT s.id source_id,s.content_hash,s.retrieved_url,s.canonical_url,"
-        "s.page_publication_date,s.document_hash FROM sources s WHERE "
+        "s.page_publication_date,s.document_hash,s.original_url,s.resolved_original_url,"
+        "s.archive_timestamp,s.http_status,s.redirect_history_json FROM sources s WHERE "
         "EXISTS (SELECT 1 FROM evidence e WHERE e.source_id=s.id AND e.research_question_id=?) "
         "OR EXISTS (SELECT 1 FROM candidates c JOIN queries q ON q.id=c.query_id "
         "WHERE c.source_id=s.id AND q.research_question_id=?) ORDER BY s.id",
@@ -132,6 +138,12 @@ def markdown_report(db: Database, question_id: int) -> str:
         "c.fetch_redirects_json,q.query FROM candidates c "
         "JOIN queries q ON q.id=c.query_id "
         "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL ORDER BY c.id",
+        (question_id,),
+    )
+    archive_gaps = db.rows(
+        "SELECT a.original_url,a.detail,q.query FROM archive_lookups a "
+        "JOIN queries q ON q.id=a.query_id WHERE a.research_question_id=? "
+        "AND a.status='gap' ORDER BY a.id",
         (question_id,),
     )
     leads = db.rows(
@@ -270,6 +282,13 @@ def markdown_report(db: Database, question_id: int) -> str:
                     f"({capture['retrieved_url']}); page date {_cell(capture['page_publication_date'])} "
                     "(unverified for any quote)."
                 )
+                if capture["archive_timestamp"]:
+                    lines.append(
+                        f"    Original {_cell(capture['original_url'])}; resolved original "
+                        f"{_cell(capture['resolved_original_url'])}; capture "
+                        f"{capture['archive_timestamp']}; HTTP {capture['http_status']}; "
+                        f"redirects {_cell(capture['redirect_history_json'])}."
+                    )
     lines.extend(["", "## Evidence in relation to each hypothesis", ""])
     for h in hypotheses:
         lines.extend([f"### H{h['id']}: {_cell(h['statement'])}", ""])
@@ -427,10 +446,13 @@ def markdown_report(db: Database, question_id: int) -> str:
                 f"{_cell(failure['fetch_error'])}{destination}; "
                 f"discovered by `{_cell(failure['query'])}`"
             )
-    else:
+    for gap in archive_gaps:
         lines.append(
-            "None recorded. Ordinary HTML retrieval cannot establish archive or PDF coverage."
+            f"- Wayback lookup for {_cell(gap['original_url'])} — unresolved: "
+            f"{_cell(gap['detail'])}; discovered by `{_cell(gap['query'])}`"
         )
+    if not failures and not archive_gaps:
+        lines.append("None recorded.")
     lines.extend(
         [
             "",
@@ -441,11 +463,21 @@ def markdown_report(db: Database, question_id: int) -> str:
         ]
     )
     for e in displayed:
+        discovery = (
+            f" discovery query Q{e['discovered_by_query_id']}; "
+            f"source target {_cell(e['source_target'])}."
+            if e["discovered_by_query_id"]
+            else ""
+        )
         lines.append(
             f"- E{e['id']} → source {e['source_id']}, retrieved {e['retrieval_date']}, "
             f"quote offset {e['quote_start']}, text SHA-256 `{e['content_hash']}`, "
             f"document SHA-256 `{e['document_hash']}`, "
             f"type {_cell(e['source_type'])}; "
-            f"author {_cell(e['author'])}; canonical alias {_cell(e['canonical_url'])}."
+            f"author {_cell(e['author'])}; canonical alias {_cell(e['canonical_url'])}; "
+            f"original {_cell(e['original_url'])}; resolved original "
+            f"{_cell(e['resolved_original_url'])}; archive capture "
+            f"{_cell(e['archive_timestamp'])}; HTTP {_cell(e['http_status'])}; "
+            f"redirects {_cell(e['redirect_history_json'])}.{discovery}"
         )
     return "\n".join(lines).rstrip() + "\n"

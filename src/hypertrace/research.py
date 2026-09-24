@@ -37,6 +37,8 @@ from hypertrace.planner import (
     SCREEN_SYSTEM,
 )
 from hypertrace.retrieval.base import FetchFailure, Retrieval
+from hypertrace.retrieval.wayback import ArchiveGap, Snapshot, Wayback
+from hypertrace.retrieval.web import BraveWeb
 
 
 class BudgetStop(Exception):
@@ -219,10 +221,16 @@ class Researcher:
         question_id: int,
         limits: Limits,
         model: str | None = None,
+        archive: Wayback | None = None,
     ):
         self.db = db
         self.llm = llm
         self.retrieval = retrieval
+        self.archive = (
+            archive
+            if archive is not None
+            else (Wayback(retrieval) if isinstance(retrieval, BraveWeb) else None)
+        )
         self.config = config
         self.question_id = question_id
         self.limits = limits
@@ -509,13 +517,54 @@ class Researcher:
             [(item.url, item.title) for item in results[:5]],
         )
 
+    async def _archive_lookup(self, target: dict) -> None:
+        if self.archive is None:
+            return
+        self._check()
+        try:
+            snapshots = await asyncio.wait_for(
+                self.archive.lookup(
+                    target["original_url"],
+                    target["start_year"],
+                    target["end_year"],
+                    target["start_date"],
+                    target["end_date"],
+                ),
+                timeout=max(0.001, self.deadline - time.monotonic()),
+            )
+            detail = f"{len(snapshots)} useful snapshots"
+        except ArchiveGap as exc:
+            snapshots = []
+            detail = str(exc)
+        except TimeoutError:
+            snapshots = []
+            detail = "CDX lookup timed out"
+        self.db.record_archive_lookup(
+            self.question_id, target["query_id"], target["original_url"], snapshots, detail
+        )
+        self._record("archive_lookup", f"url={target['original_url']} {detail}")
+
     async def _one_candidate(self, candidate: dict) -> bool:
         source_id = candidate["source_id"]
         if source_id is None:
             self._check()
             try:
+                if candidate["archive_timestamp"]:
+                    if self.archive is None:
+                        raise ArchiveGap("Wayback retrieval unavailable")
+                    fetch = self.archive.fetch(
+                        candidate["original_url"],
+                        Snapshot(
+                            candidate["archive_timestamp"],
+                            candidate["resolved_original_url"],
+                            candidate["url"],
+                            "",
+                        ),
+                    )
+                else:
+                    fetch = self.retrieval.fetch(candidate["url"])
                 source = await asyncio.wait_for(
-                    self.retrieval.fetch(candidate["url"]),
+                    fetch,
                     timeout=max(0.001, self.deadline - time.monotonic()),
                 )
             except TimeoutError as exc:
@@ -524,8 +573,13 @@ class Researcher:
                     candidate["id"], "Fetch timed out", retryable=True, final_url=candidate["url"]
                 )
                 raise BudgetStop("max_minutes") from exc
-            except (FetchFailure, httpx.HTTPError, ValueError, OSError) as exc:
-                if isinstance(exc, FetchFailure):
+            except (ArchiveGap, FetchFailure, httpx.HTTPError, ValueError, OSError) as exc:
+                if isinstance(exc, ArchiveGap):
+                    status = exc.status_code
+                    final_url = exc.final_url or candidate["url"]
+                    redirects = exc.redirect_chain
+                    retryable = exc.retryable
+                elif isinstance(exc, FetchFailure):
                     status = exc.status_code
                     final_url = exc.final_url
                     redirects = exc.redirect_chain
@@ -540,7 +594,7 @@ class Researcher:
                     final_url = candidate["url"]
                     redirects = None
                     retryable = isinstance(exc, httpx.TransportError)
-                reason = self._safe_fetch_error(exc)
+                reason = str(exc) if isinstance(exc, ArchiveGap) else self._safe_fetch_error(exc)
                 self._record("fetch", f"candidate_id={candidate['id']} failed: {reason}")
                 self.db.record_fetch_failure(
                     candidate["id"],
@@ -557,7 +611,11 @@ class Researcher:
         else:
             row = self.db.rows("SELECT * FROM sources WHERE id=?", (source_id,))[0]
             source = Source.model_validate(
-                dict(row) | {"content_regions": json.loads(row["regions_json"])}
+                dict(row)
+                | {
+                    "content_regions": json.loads(row["regions_json"]),
+                    "redirect_history": json.loads(row["redirect_history_json"]),
+                }
             )
         if self.db.document_already_assessed(source.content_hash, self.question_id):
             self.db.finish_candidate(candidate["id"])
@@ -854,6 +912,12 @@ class Researcher:
                 review_query_id = self.db.review_due(self.question_id)
                 if review_query_id is not None:
                     await self._review(review_query_id)
+                    continue
+                archive_target = (
+                    self.db.next_archive_lookup(self.question_id) if self.archive else None
+                )
+                if archive_target:
+                    await self._archive_lookup(archive_target)
                     continue
                 context = self._context()
                 if (

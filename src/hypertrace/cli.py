@@ -23,6 +23,15 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Create database and seed motivating case")
     target = sub.add_parser("target-sources", help="Install unresolved primary-source targets")
     target.add_argument("--question-id", type=int)
+    archive_target = sub.add_parser("archive-target", help="Add a known URL to a source target")
+    archive_target.add_argument("key")
+    archive_target.add_argument("url")
+    archive_target.add_argument("--title", default="")
+    archive_target.add_argument("--start-year", type=int)
+    archive_target.add_argument("--end-year", type=int)
+    archive_target.add_argument("--start-date")
+    archive_target.add_argument("--end-date")
+    archive_target.add_argument("--question-id", type=int)
     create = sub.add_parser("research", help="Add a new research question")
     create.add_argument("question")
     create.add_argument("--hypothesis", action="append", default=[])
@@ -96,6 +105,19 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "target-sources":
             seed_source_targets(db, qid)
             print(f"Installed unresolved source targets for question {qid}")
+            return
+        if args.command == "archive-target":
+            db.add_archive_target(
+                qid,
+                args.key,
+                args.url,
+                args.title,
+                args.start_year,
+                args.end_year,
+                args.start_date,
+                args.end_date,
+            )
+            print(f"Added archive URL for {args.key}")
             return
         if args.command == "activate-query":
             activated = db.activate_deferred_query(qid, args.query_id)

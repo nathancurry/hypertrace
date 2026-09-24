@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from hypertrace.db import Database
 from hypertrace.models import Hypothesis, ResearchQuestion, SearchQuery
 
@@ -99,6 +101,28 @@ def seed_source_targets(db: Database, question_id: int) -> None:
             for key, text in TARGET_QUERIES
         ],
     )
+    db.add_archive_target(
+        question_id,
+        "pc-music-2014",
+        "https://pitchfork.com/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual/",
+        "PC Music's Twisted Electronic Pop: A User's Manual",
+        2014,
+        2014,
+    )
+    path = "/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual"
+    for row in db.rows(
+        "SELECT url FROM candidates WHERE url LIKE ? UNION SELECT retrieved_url AS url "
+        "FROM sources WHERE retrieved_url LIKE ?",
+        (f"%{path}%", f"%{path}%"),
+    ):
+        url = row["url"]
+        host = urlsplit(url).hostname or ""
+        if host == "web.archive.org":
+            continue
+        if (host == "pitchfork.com" or host.endswith(".pitchfork.com")) and urlsplit(
+            url
+        ).path.rstrip("/") == path:
+            db.add_archive_target(question_id, "pc-music-2014", url, start_year=2014, end_year=2014)
 
 
 def seed_motivating_case(db: Database) -> int:

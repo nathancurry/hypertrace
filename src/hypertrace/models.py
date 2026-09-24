@@ -132,6 +132,11 @@ class Source(BaseModel):
     retrieval_date: str = Field(default_factory=utc_now)
     source_type: str = "web_page"
     archive_url: str | None = None
+    original_url: str | None = None
+    resolved_original_url: str | None = None
+    archive_timestamp: str | None = None
+    http_status: int | None = None
+    redirect_history: list[str] = Field(default_factory=list)
     content_hash: str
     document_hash: str | None = None
     content: str
