@@ -22,7 +22,8 @@ def markdown_report(db: Database, question_id: int) -> str:
         raise ValueError(f"Unknown question ID {question_id}")
     question = questions[0]
     latest_run = db.rows(
-        "SELECT status,stop_reason,actions_taken,provider_requests,unknown_spend_requests "
+        "SELECT status,stop_reason,actions_taken,provider_requests,unknown_spend_requests,"
+        "provider_reported_cost,locally_estimated_cost "
         "FROM runs WHERE research_question_id=? ORDER BY id DESC LIMIT 1",
         (question_id,),
     )
@@ -159,7 +160,9 @@ def markdown_report(db: Database, question_id: int) -> str:
         lines.append(
             f"Latest run: {_cell(run['status'])} ({_cell(run['stop_reason'])}); "
             f"{run['actions_taken']} logical actions, {run['provider_requests']} provider requests, "
-            f"{run['unknown_spend_requests']} requests with unknown spend."
+            f"provider-reported cost ${run['provider_reported_cost']:.4f}, "
+            f"locally estimated cost ${run['locally_estimated_cost']:.4f}, "
+            f"{run['unknown_spend_requests']} requests with provider billing unknown."
         )
     lines.extend(["", "## Competing hypotheses (interpretations)", ""])
     if hypotheses:

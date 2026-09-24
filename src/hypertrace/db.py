@@ -111,7 +111,9 @@ CREATE TABLE IF NOT EXISTS runs (
   input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
   estimated_cost REAL NOT NULL, stop_reason TEXT NOT NULL,
   provider_requests INTEGER NOT NULL DEFAULT 0,
-  unknown_spend_requests INTEGER NOT NULL DEFAULT 0
+  unknown_spend_requests INTEGER NOT NULL DEFAULT 0,
+  provider_reported_cost REAL NOT NULL DEFAULT 0,
+  locally_estimated_cost REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS actions (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -147,6 +149,10 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
   ended_at TEXT, outcome TEXT NOT NULL, input_tokens INTEGER,
   output_tokens INTEGER, estimated_cost REAL,
   usage_reported INTEGER NOT NULL DEFAULT 0,
+  local_input_tokens INTEGER,
+  local_output_tokens INTEGER,
+  local_estimated_cost REAL,
+  provider_billing_unknown INTEGER NOT NULL DEFAULT 1,
   diagnostics_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_question ON evidence(research_question_id);
@@ -242,8 +248,16 @@ class Database:
             "runs": {
                 "provider_requests": "INTEGER NOT NULL DEFAULT 0",
                 "unknown_spend_requests": "INTEGER NOT NULL DEFAULT 0",
+                "provider_reported_cost": "REAL NOT NULL DEFAULT 0",
+                "locally_estimated_cost": "REAL NOT NULL DEFAULT 0",
             },
-            "provider_attempts": {"diagnostics_json": "TEXT NOT NULL DEFAULT '{}'"},
+            "provider_attempts": {
+                "diagnostics_json": "TEXT NOT NULL DEFAULT '{}'",
+                "local_input_tokens": "INTEGER",
+                "local_output_tokens": "INTEGER",
+                "local_estimated_cost": "REAL",
+                "provider_billing_unknown": "INTEGER NOT NULL DEFAULT 1",
+            },
         }
         legacy_evidence = "quote_region" not in {
             row["name"] for row in self.conn.execute("PRAGMA table_info(evidence)")
@@ -252,11 +266,23 @@ class Database:
             row["name"] for row in self.conn.execute("PRAGMA table_info(queries)")
         }
         with self.conn:
+            needs_cost_backfill = "provider_reported_cost" not in {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(runs)")
+            }
             for table, columns in additions.items():
                 existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
                 for name, declaration in columns.items():
                     if name not in existing:
                         self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            if needs_cost_backfill:
+                self.conn.execute(
+                    "UPDATE provider_attempts SET provider_billing_unknown=1-usage_reported"
+                )
+                self.conn.execute(
+                    "UPDATE runs SET provider_reported_cost=COALESCE(("
+                    "SELECT SUM(estimated_cost) FROM provider_attempts "
+                    "WHERE run_id=runs.id AND usage_reported=1),0)"
+                )
             if legacy_frontier:
                 self._migrate_frontier_tx()
             else:
@@ -1253,12 +1279,15 @@ class Database:
                     "UPDATE runs SET actions_taken=actions_taken+1 WHERE id=?", (run_id,)
                 )
 
-    def start_provider_attempt(self, run_id: int, action: str, model: str) -> int:
+    def start_provider_attempt(
+        self, run_id: int, action: str, model: str, local_input_tokens: int
+    ) -> int:
         with self.conn:
             cursor = self.conn.execute(
-                "INSERT INTO provider_attempts (run_id,logical_action,model,started_at,outcome) "
-                "VALUES (?,?,?,?,?)",
-                (run_id, action, model, utc_now(), "in_flight"),
+                "INSERT INTO provider_attempts "
+                "(run_id,logical_action,model,started_at,outcome,local_input_tokens) "
+                "VALUES (?,?,?,?,?,?)",
+                (run_id, action, model, utc_now(), "in_flight", local_input_tokens),
             )
             self.conn.execute(
                 "UPDATE runs SET provider_requests=provider_requests+1,"
@@ -1275,21 +1304,31 @@ class Database:
         output_tokens: int | None,
         input_rate: float,
         output_rate: float,
+        local_output_tokens: int,
+        local_usage_multiplier: float,
         diagnostics: dict | None = None,
     ) -> float:
         known = input_tokens is not None and output_tokens is not None
-        cost = (
+        reported_cost = (
             (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000 if known else None
         )
         with self.conn:
             attempt = self.conn.execute(
-                "SELECT run_id,ended_at FROM provider_attempts WHERE id=?", (attempt_id,)
+                "SELECT run_id,ended_at,local_input_tokens FROM provider_attempts WHERE id=?",
+                (attempt_id,),
             ).fetchone()
             if attempt is None or attempt["ended_at"] is not None:
                 raise ValueError("Provider attempt already finished or missing")
+            local_cost = (
+                (attempt["local_input_tokens"] * input_rate + local_output_tokens * output_rate)
+                * local_usage_multiplier
+                / 1_000_000
+            )
+            cost = reported_cost if reported_cost is not None else local_cost
             self.conn.execute(
                 "UPDATE provider_attempts SET ended_at=?,outcome=?,input_tokens=?,"
-                "output_tokens=?,estimated_cost=?,usage_reported=?,diagnostics_json=? WHERE id=?",
+                "output_tokens=?,estimated_cost=?,usage_reported=?,local_output_tokens=?,"
+                "local_estimated_cost=?,provider_billing_unknown=?,diagnostics_json=? WHERE id=?",
                 (
                     utc_now(),
                     outcome,
@@ -1297,18 +1336,30 @@ class Database:
                     output_tokens,
                     cost,
                     int(known),
+                    local_output_tokens,
+                    local_cost,
+                    int(not known),
                     json.dumps(diagnostics or {}),
                     attempt_id,
                 ),
             )
-            if known:
-                self.conn.execute(
-                    "UPDATE runs SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,"
-                    "estimated_cost=estimated_cost+?,"
-                    "unknown_spend_requests=unknown_spend_requests-1 WHERE id=?",
-                    (input_tokens, output_tokens, cost, attempt["run_id"]),
-                )
-        return float(cost or 0)
+            self.conn.execute(
+                "UPDATE runs SET estimated_cost=estimated_cost+?,"
+                "provider_reported_cost=provider_reported_cost+?,"
+                "locally_estimated_cost=locally_estimated_cost+?,"
+                "unknown_spend_requests=unknown_spend_requests-?,"
+                "input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE id=?",
+                (
+                    cost,
+                    reported_cost or 0,
+                    0 if known else local_cost,
+                    int(known),
+                    input_tokens or 0,
+                    output_tokens or 0,
+                    attempt["run_id"],
+                ),
+            )
+        return float(cost)
 
     def finish_run(self, run_id: int, status: str, reason: str) -> None:
         with self.conn:

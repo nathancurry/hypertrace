@@ -32,7 +32,7 @@ from hypertrace.models import (
     TermSense,
 )
 from hypertrace.reports import markdown_report
-from hypertrace.research import Limits, Researcher
+from hypertrace.research import BudgetStop, Limits, Researcher, _AttemptLogger
 from hypertrace.retrieval.base import FetchFailure, SearchResult
 from hypertrace.retrieval.web import BraveWeb, canonicalize_url
 
@@ -1299,7 +1299,7 @@ def test_unsupported_pdf_remains_an_explicit_gap(tmp_path):
         assert "application/pdf" in markdown_report(db, qid)
 
 
-def test_unreported_provider_spend_is_not_counted_as_zero(tmp_path):
+def test_unreported_provider_usage_has_local_estimate_and_unknown_billing(tmp_path):
     async def exercise():
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
@@ -1324,11 +1324,99 @@ def test_unreported_provider_spend_is_not_counted_as_zero(tmp_path):
                     Limits(max_actions=3, max_cost=1),
                 ).run()
                 run = db.rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
-                assert run["stop_reason"] == "unknown_spend_for_cost_limit"
+                assert run["stop_reason"] == "no_new_queries"
                 assert (run["provider_requests"], run["unknown_spend_requests"]) == (1, 1)
-                assert db.rows("SELECT usage_reported FROM provider_attempts")[0][0] == 0
+                attempt = db.rows("SELECT * FROM provider_attempts")[0]
+                assert attempt["usage_reported"] == 0
+                assert attempt["provider_billing_unknown"] == 1
+                assert attempt["local_input_tokens"] > 0
+                assert attempt["local_output_tokens"] > 0
+                assert run["provider_reported_cost"] == 0
+                assert run["locally_estimated_cost"] == attempt["local_estimated_cost"] > 0
 
     asyncio.run(exercise())
+
+
+def test_http_503_estimate_and_reported_retry_are_separate(tmp_path):
+    requests: list[bytes] = []
+    databases: list[Database] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        started = databases[0].rows(
+            "SELECT local_input_tokens,ended_at FROM provider_attempts ORDER BY id DESC LIMIT 1"
+        )[0]
+        assert started["local_input_tokens"] == (len(request.content) + 3) // 4
+        assert started["ended_at"] is None
+        requests.append(request.content)
+        if len(requests) == 1:
+            return httpx.Response(503, json={"error": {"message": "temporarily unavailable"}})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"queries": []}'}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+            },
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client)
+            config = _config(tmp_path)
+            with Database(config.db_path) as db:
+                databases.append(db)
+                qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+                run_id = await Researcher(
+                    db, llm, FakeRetrieval(), config, qid, Limits(max_actions=3)
+                ).run()
+                run = db.rows("SELECT * FROM runs WHERE id=?", (run_id,))[0]
+                failed, retry = db.rows(
+                    "SELECT * FROM provider_attempts WHERE run_id=? ORDER BY id", (run_id,)
+                )
+                assert requests[0] == requests[1]
+                assert failed["outcome"] == "http_503"
+                assert failed["local_input_tokens"] == (len(requests[0]) + 3) // 4
+                assert failed["local_output_tokens"] == 0
+                assert failed["usage_reported"] == 0
+                assert failed["provider_billing_unknown"] == 1
+                assert failed["estimated_cost"] == failed["local_estimated_cost"] > 0
+                assert retry["outcome"] == "validated"
+                assert retry["local_input_tokens"] == failed["local_input_tokens"]
+                assert (retry["input_tokens"], retry["output_tokens"]) == (7, 2)
+                assert retry["estimated_cost"] == 9 / 1_000_000
+                assert retry["local_estimated_cost"] > retry["estimated_cost"]
+                assert retry["usage_reported"] == 1
+                assert retry["provider_billing_unknown"] == 0
+                assert run["provider_requests"] == 2
+                assert run["unknown_spend_requests"] == 1
+                assert run["provider_reported_cost"] == retry["estimated_cost"]
+                assert run["locally_estimated_cost"] == failed["estimated_cost"]
+                assert run["estimated_cost"] == (
+                    run["provider_reported_cost"] + run["locally_estimated_cost"]
+                )
+                report = markdown_report(db, qid)
+                assert "provider-reported cost" in report
+                assert "locally estimated cost" in report
+                assert "1 requests with provider billing unknown" in report
+
+    asyncio.run(exercise())
+
+
+def test_max_cost_counts_locally_estimated_failed_request(tmp_path):
+    config = _config(tmp_path)
+    with Database(config.db_path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        researcher = Researcher(db, FakeLLM(), FakeRetrieval(), config, qid, Limits(max_cost=0.001))
+        researcher.run_id = db.start_run(
+            ResearchRun(research_question_id=qid, model="test", provider="test")
+        )
+        observer = _AttemptLogger(researcher, "review")
+        attempt_id = observer.started("test", 1000)
+        with pytest.raises(BudgetStop, match="max_cost"):
+            observer.finished(attempt_id, "http_503", None, None, 0, {"http_status": 503})
+        run = db.rows("SELECT * FROM runs WHERE id=?", (researcher.run_id,))[0]
+        assert run["locally_estimated_cost"] == 0.00125
+        assert run["unknown_spend_requests"] == 1
+        assert db.rows("SELECT provider_billing_unknown FROM provider_attempts")[0][0] == 1
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ class Config:
     output_cost_per_million: float
     min_yield: float
     json_mode: bool
+    local_usage_multiplier: float = 1.25
 
     @classmethod
     def from_env(cls) -> Config:
@@ -36,9 +38,12 @@ class Config:
             output_cost_per_million=float(os.getenv("LLM_OUTPUT_COST_PER_MILLION", "0")),
             min_yield=float(os.getenv("HYPERTRACE_MIN_YIELD", "0.05")),
             json_mode=os.getenv("LLM_JSON_MODE", "true").lower() == "true",
+            local_usage_multiplier=float(os.getenv("HYPERTRACE_LOCAL_USAGE_MULTIPLIER", "1.25")),
         )
 
     def require_online(self, max_cost: float | None = None) -> None:
+        if not math.isfinite(self.local_usage_multiplier) or self.local_usage_multiplier < 1:
+            raise ValueError("HYPERTRACE_LOCAL_USAGE_MULTIPLIER must be at least 1")
         if not self.llm_api_key:
             raise ValueError("Set LLM_API_KEY for research runs")
         if not self.brave_api_key:

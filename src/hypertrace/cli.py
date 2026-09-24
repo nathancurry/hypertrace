@@ -104,8 +104,9 @@ def main(argv: list[str] | None = None) -> None:
                 f"Run {run_id}: {row['status']} ({row['stop_reason']}), "
                 f"{row['actions_taken']} logical actions, "
                 f"{row['provider_requests']} provider requests, "
-                f"known estimated cost ${row['estimated_cost']:.4f}, "
-                f"{row['unknown_spend_requests']} requests with unknown spend"
+                f"provider-reported cost ${row['provider_reported_cost']:.4f}, "
+                f"locally estimated cost ${row['locally_estimated_cost']:.4f}, "
+                f"{row['unknown_spend_requests']} requests with provider billing unknown"
             )
         elif args.command == "status":
             q = db.rows("SELECT * FROM questions WHERE id=?", (qid,))[0]
@@ -137,7 +138,9 @@ def main(argv: list[str] | None = None) -> None:
                 print(
                     f"Last run {r['id']}: {r['status']} ({r['stop_reason']}); "
                     f"{r['provider_requests']} provider requests; "
-                    f"{r['unknown_spend_requests']} with unknown spend"
+                    f"provider-reported cost ${r['provider_reported_cost']:.4f}; "
+                    f"locally estimated cost ${r['locally_estimated_cost']:.4f}; "
+                    f"{r['unknown_spend_requests']} with provider billing unknown"
                 )
         elif args.command == "evidence":
             for row in db.rows(

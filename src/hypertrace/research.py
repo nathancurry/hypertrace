@@ -162,8 +162,10 @@ class _AttemptLogger:
         self.researcher = researcher
         self.action = action
 
-    def started(self, model: str) -> int:
-        return self.researcher.db.start_provider_attempt(self.researcher.run_id, self.action, model)
+    def started(self, model: str, local_input_tokens: int) -> int:
+        return self.researcher.db.start_provider_attempt(
+            self.researcher.run_id, self.action, model, local_input_tokens
+        )
 
     def finished(
         self,
@@ -171,6 +173,7 @@ class _AttemptLogger:
         outcome: str,
         input_tokens: int | None,
         output_tokens: int | None,
+        local_output_tokens: int,
         diagnostics: dict,
     ) -> None:
         researcher = self.researcher
@@ -181,13 +184,11 @@ class _AttemptLogger:
             output_tokens,
             researcher.config.input_cost_per_million,
             researcher.config.output_cost_per_million,
+            local_output_tokens,
+            researcher.config.local_usage_multiplier,
             diagnostics,
         )
         researcher.cost += cost
-        if input_tokens is None or output_tokens is None:
-            researcher.unknown_spend = True
-            if researcher.limits.max_cost is not None:
-                raise BudgetStop("unknown_spend_for_cost_limit")
         if researcher.limits.max_cost is not None and researcher.cost >= researcher.limits.max_cost:
             raise BudgetStop("max_cost")
 
@@ -230,7 +231,6 @@ class Researcher:
         self.run_id = 0
         self.actions = 0
         self.cost = 0.0
-        self.unknown_spend = False
         self.fetched = 0
         self.evidence_added = 0
         self.recent_yields: deque[int] = deque(maxlen=3)
@@ -363,9 +363,11 @@ class Researcher:
             result.output_tokens,
             provider_tracked=provider_tracked,
         )
-        if self.limits.max_cost is not None and self.unknown_spend:
-            raise BudgetStop("unknown_spend_for_cost_limit")
-        if self.limits.max_cost is not None and not (result.input_tokens or result.output_tokens):
+        if (
+            self.limits.max_cost is not None
+            and not provider_tracked
+            and not (result.input_tokens or result.output_tokens)
+        ):
             raise BudgetStop("missing_usage_for_cost_limit")
         return result.value
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from hashlib import sha256
@@ -20,7 +21,7 @@ PREVIEW_END_CHARS = 160
 
 
 class AttemptObserver(Protocol):
-    def started(self, model: str) -> int: ...
+    def started(self, model: str, local_input_tokens: int) -> int: ...
 
     def finished(
         self,
@@ -28,6 +29,7 @@ class AttemptObserver(Protocol):
         outcome: str,
         input_tokens: int | None,
         output_tokens: int | None,
+        local_output_tokens: int,
         diagnostics: dict,
     ) -> None: ...
 
@@ -200,20 +202,25 @@ class OpenAICompatibleLLM:
                 body["response_format"] = {"type": "json_object"}
             if policy.reasoning_effort:
                 body["reasoning_effort"] = policy.reasoning_effort
+            request = self.client.build_request(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=policy.timeout_seconds,
+            )
+            local_input_tokens = math.ceil(len(request.content) / 4)
+            local_output_tokens = 0
             observer = self.attempt_observer
-            attempt_id = observer.started(model) if observer else None
+            attempt_id = observer.started(model, local_input_tokens) if observer else None
             attempt_input: int | None = None
             attempt_output: int | None = None
             outcome = "unknown_failure"
             diagnostics: dict = _response_diagnostics(None, None, self.api_key)
             diagnostics["attempt_kind"] = attempt_kind
+            diagnostics["local_input_tokens"] = local_input_tokens
             try:
-                response = await self.client.post(
-                    f"{self.base_url}/chat/completions",
-                    json=body,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=policy.timeout_seconds,
-                )
+                response = await self.client.send(request)
                 try:
                     payload = response.json()
                 except json.JSONDecodeError:
@@ -222,22 +229,33 @@ class OpenAICompatibleLLM:
                 diagnostics["attempt_kind"] = attempt_kind
                 diagnostics["max_completion_tokens"] = policy.max_completion_tokens
                 diagnostics["reasoning_effort_requested"] = policy.reasoning_effort
+                if isinstance(payload, dict):
+                    usage = payload.get("usage")
+                    if isinstance(usage, dict):
+                        prompt_count = usage.get("prompt_tokens")
+                        completion_count = usage.get("completion_tokens")
+                        if isinstance(completion_count, int) and not isinstance(
+                            completion_count, bool
+                        ):
+                            diagnostics["reported_completion_tokens"] = completion_count
+                        if all(
+                            isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                            for count in (prompt_count, completion_count)
+                        ):
+                            attempt_input = prompt_count
+                            attempt_output = completion_count
+                            input_tokens += attempt_input
+                            output_tokens += attempt_output
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        message = choices[0].get("message")
+                        if isinstance(message, dict) and isinstance(message.get("content"), str):
+                            local_output_tokens = math.ceil(len(message["content"].encode()) / 4)
                 response.raise_for_status()
                 if not isinstance(payload, dict):
                     raise ProviderOutputError("Provider returned a non-object or non-JSON response")
                 if payload.get("error") is not None:
                     raise ProviderOutputError("Provider returned an error field")
-                usage = payload.get("usage") or {}
-                if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
-                    diagnostics["reported_completion_tokens"] = usage["completion_tokens"]
-                if isinstance(usage, dict) and (
-                    usage.get("prompt_tokens") is not None
-                    and usage.get("completion_tokens") is not None
-                ):
-                    attempt_input = int(usage["prompt_tokens"])
-                    attempt_output = int(usage["completion_tokens"])
-                    input_tokens += attempt_input
-                    output_tokens += attempt_output
                 choices = payload.get("choices")
                 if not isinstance(choices, list) or not choices:
                     raise ProviderOutputError("Provider returned no completion choices")
@@ -345,12 +363,18 @@ class OpenAICompatibleLLM:
                     raise
                 last_error = exc
             finally:
+                diagnostics["local_output_tokens"] = local_output_tokens
                 logger.info(
                     "completion_attempt %s", json.dumps({"outcome": outcome, **diagnostics})
                 )
                 if observer is not None and attempt_id is not None:
                     observer.finished(
-                        attempt_id, outcome, attempt_input, attempt_output, diagnostics
+                        attempt_id,
+                        outcome,
+                        attempt_input,
+                        attempt_output,
+                        local_output_tokens,
+                        diagnostics,
                     )
             if is_repair:
                 break
