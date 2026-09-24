@@ -67,6 +67,7 @@ class _PageParser(HTMLParser):
         self.search_aggregator = False
         self.article_count = 0
         self.article_tail_region: QuoteRegion | None = None
+        self.main_paragraphs: set[int] = set()
 
     def _region(self, tag: str, attrs: dict[str, str | None]) -> QuoteRegion:
         marker = " ".join(str(attrs.get(key) or "") for key in ("class", "id", "role", "itemtype"))
@@ -87,13 +88,18 @@ class _PageParser(HTMLParser):
             or "result" in marker.split()
         ):
             self.search_aggregator = True
-        if self.stack and self.stack[-1][1] in {
-            QuoteRegion.NAVIGATION,
-            QuoteRegion.TAG,
-            QuoteRegion.RELATED_CONTENT,
-        }:
-            return self.stack[-1][1]
-        if tag in {"nav", "footer", "header"} or "navigation" in marker:
+        parent_region = self.stack[-1][1] if self.stack else QuoteRegion.UNKNOWN
+        if parent_region in {QuoteRegion.TAG, QuoteRegion.RELATED_CONTENT}:
+            return parent_region
+        if parent_region == QuoteRegion.NAVIGATION and any(
+            ancestor in {"nav", "footer", "header"} for ancestor, _, _ in self.stack
+        ):
+            return QuoteRegion.NAVIGATION
+        if (
+            tag in {"nav", "footer", "header", "button"}
+            or attrs.get("role") == "navigation"
+            or "footer" in marker
+        ):
             return QuoteRegion.NAVIGATION
         if tag == "aside" or any(
             word in marker
@@ -115,7 +121,15 @@ class _PageParser(HTMLParser):
             return QuoteRegion.RELATED_CONTENT
         if "tag" in (attrs.get("rel") or "").lower().split() or any(
             word in marker
-            for word in ("tag-list", "tags", "post-tag", "tag-cloud", "taxonomy", "topics")
+            for word in (
+                "tag-list",
+                "tags",
+                "post-tag",
+                "tag-cloud",
+                "tagcloud",
+                "taxonomy",
+                "topics",
+            )
         ):
             return QuoteRegion.TAG
         if tag == "title":
@@ -126,12 +140,19 @@ class _PageParser(HTMLParser):
             ancestor == "article" for ancestor, _, _ in self.stack
         ):
             return self.article_tail_region
+        if tag == "main":
+            return QuoteRegion.UNKNOWN
         if tag == "article" or any(
             word in marker
             for word in ("article-body", "post-content", "entry-content", "story-body")
         ):
             return QuoteRegion.ARTICLE_BODY
-        return self.stack[-1][1] if self.stack else QuoteRegion.UNKNOWN
+        if parent_region == QuoteRegion.NAVIGATION:
+            return QuoteRegion.NAVIGATION
+        # Site-wide layout classes can mention navigation without containing it.
+        if tag not in {"html", "body"} and "navigation" in marker:
+            return QuoteRegion.NAVIGATION
+        return parent_region
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = dict(attrs)
@@ -194,6 +215,12 @@ class _PageParser(HTMLParser):
                 self.block_ids.append(self.next_block_id)
             else:
                 self.block_ids.append(self.block_ids[-1] if self.block_ids else 0)
+            if (
+                tag == "p"
+                and region == QuoteRegion.UNKNOWN
+                and any(ancestor == "main" for ancestor, _, _ in self.stack)
+            ):
+                self.main_paragraphs.add(self.block_ids[-1])
 
     def handle_endtag(self, tag: str) -> None:
         for index in range(len(self.stack) - 1, -1, -1):
@@ -235,10 +262,17 @@ class _PageParser(HTMLParser):
             )
 
     def rendered(self) -> tuple[str, list[ContentRegion]]:
+        # A substantial paragraph inside main can supply prose when article markup is absent.
+        paragraph_lengths: dict[int, int] = {}
+        for part, _, _, block_id in self.parts:
+            if block_id in self.main_paragraphs:
+                paragraph_lengths[block_id] = paragraph_lengths.get(block_id, 0) + len(part)
         content_parts: list[str] = []
         regions: list[ContentRegion] = []
         position = 0
         for part, region, card, block_id in self.parts:
+            if region == QuoteRegion.UNKNOWN and paragraph_lengths.get(block_id, 0) >= 120:
+                region = QuoteRegion.ARTICLE_BODY
             if content_parts:
                 content_parts.append(" ")
                 position += 1

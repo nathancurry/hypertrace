@@ -633,6 +633,102 @@ def _assess_stored_page(
     return qid, candidate_id
 
 
+def test_pitchfork_like_article_layout_reaches_assessment_without_chrome(tmp_path):
+    quote = "The shadowy operation and its bewildering brand of hyper-pop have been everywhere."
+    navigation = "Navigation hyper-pop is a menu label."
+    footer = "Footer hyper-pop is not an article quotation."
+    html = f"""<html><head><title>PC Music's Twisted Electronic Pop</title>
+    <meta property="article:published_time" content="2014-09-17T10:00:00Z"></head>
+    <body class="stackednavigation-site-navigation fixed-header-large-logo-nav-variation">
+    <nav>{navigation}</nav><div id="app-root"><div class="layout-navigation">
+    <main id="main-content"><article class="article main-content story">
+    <div class="article-body__content"><button>Save this story</button>
+    <div class="ArticlePageChunks"><div class="BodyWrapper article__body">
+    <p>What is PC Music? {quote}</p><p>{"More analysis of PC Music. " * 750}</p>
+    </div></div></div></article><aside>Related hyper-pop stories</aside>
+    <div class="article-body__footer"><div class="TagCloudWrapper">Tags hyper-pop</div></div>
+    </main></div></div><footer>{footer}</footer></body></html>"""
+
+    async def fetch():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, text=html, headers={"content-type": "text/html"})
+            )
+        ) as client:
+            return await BraveWeb("key", client).fetch(
+                "https://pitchfork.com/thepitch/485-example/"
+            )
+
+    source = asyncio.run(fetch())
+    assert len(source.content) > 16_000
+    config = _config(tmp_path)
+    llm = WindowLLM(quote)
+    with Database(config.db_path) as db:
+        question_id, candidate_id = _assess_stored_page(
+            db,
+            config,
+            source,
+            llm,
+            question="How was hyper-pop used for PC Music?",
+            query="PC Music hyper-pop Pitchfork",
+        )
+        source_id = db.rows("SELECT source_id FROM candidates WHERE id=?", (candidate_id,))[0][0]
+        assert db.quote_region(source_id, quote) == QuoteRegion.ARTICLE_BODY
+        for furniture in (
+            navigation,
+            footer,
+            "Save this story",
+            "Related hyper-pop stories",
+            "Tags hyper-pop",
+        ):
+            assert db.quote_region(source_id, furniture) != QuoteRegion.ARTICLE_BODY
+        windows = llm.prompts[0]["source"]["windows"]
+        assert any(quote in window["text"] for window in windows)
+        assert all(
+            navigation not in window["text"] and footer not in window["text"] for window in windows
+        )
+        evidence = db.rows("SELECT * FROM evidence WHERE research_question_id=?", (question_id,))
+        assert len(evidence) == 1
+        assert evidence[0]["exact_quote"] == quote
+        assert evidence[0]["evidence_type"] == "observed_usage"
+        assert evidence[0]["quote_verified_date"] is None
+
+
+def test_main_prose_without_article_does_not_promote_furniture(tmp_path):
+    prose = (
+        "A sustained account of the scene calls its sound hyper-pop and discusses its artists. " * 2
+    )
+    furniture = "The menu calls this hyper-pop."
+    html = f"""<body class="site-navigation"><nav>{furniture}</nav>
+    <div class="layout-navigation"><main><p>{prose}</p>
+    <aside>{furniture}</aside><div class="tag-cloud">{furniture}</div></main></div></body>"""
+
+    async def fetch():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, text=html, headers={"content-type": "text/html"})
+            )
+        ) as client:
+            return await BraveWeb("key", client).fetch("https://example.org/prose")
+
+    source = asyncio.run(fetch())
+    with Database(tmp_path / "research.db") as db:
+        question_id = db.add_question(ResearchQuestion(question="Where was hyper-pop used?"))
+        source_id = db.add_source(source)
+        assert db.quote_region(source_id, prose) == QuoteRegion.ARTICLE_BODY
+        assert db.quote_region(source_id, furniture) == QuoteRegion.NAVIGATION
+        with pytest.raises(ValueError, match="article-body"):
+            db.add_evidence(
+                Evidence(
+                    source_id=source_id,
+                    research_question_id=question_id,
+                    exact_quote=furniture,
+                    normalized_claim=furniture,
+                    evidence_type="observed_usage",
+                )
+            )
+
+
 def test_long_page_one_relevant_body_occurrence_is_assessed(tmp_path):
     config = _config(tmp_path)
     navigation = "Zephyrcore appears in navigation. "
