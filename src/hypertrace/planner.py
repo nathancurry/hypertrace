@@ -188,10 +188,15 @@ Classify what the term denotes in the quote; an earlier use of the string is not
 of the modern genre term. Page publication metadata never dates the quoted text.
 Titles, tags, navigation, related content, and snippets are leads, not historical usages.
 OBSERVED_USAGE means the stored historical source itself uses the term in the context being
-recorded. A later source reporting an earlier use is ATTRIBUTED_USAGE, even if it quotes the
-term. Claims about first use, coinage, origin, derivation, or influence are
-ATTRIBUTED_ORIGIN_CLAIM unless direct primary evidence is verified. Statements about an
-artist's intent are ATTRIBUTED_INTENT unless directly verified from that artist.
+recorded; the excerpt must contain or directly demonstrate that use. A later source reporting
+an earlier use is ATTRIBUTED_USAGE, even if it quotes the term. A later account of a playlist
+launch is an attributed event claim, not observed usage in the launch year. Claims about first
+use, coinage, origin, derivation, influence, or a named playlist's launch are
+ATTRIBUTED_ORIGIN_CLAIM. Original-source verification is separate from evidence category.
+Statements about an artist's intent or a song's meaning are ATTRIBUTED_INTENT.
+A later webpage quoting
+an artist is not the original interview; first-person wording does not verify a
+repost as primary evidence.
 Analysis of meaning or similarity is INTERPRETIVE_CONTEXT. Preserve secondary claims and
 identify the original article, interview, playlist, or other artifact as a lead.
 Never turn the historical date named by a later source into a verified quote date.

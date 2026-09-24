@@ -1058,6 +1058,164 @@ def test_secondary_claims_keep_attribution_and_source_leads(tmp_path, quote, cat
         assert (row["id"], row["source_id"], row["evidence_type"]) == (eid, sid, category)
 
 
+def test_reposted_artist_meaning_is_not_observed_term_usage(tmp_path):
+    path = tmp_path / "research.db"
+    artist_quote = "I go somewhere else to be aggressive, then return to my loved one."
+    term_quote = "This new music sounds like hyper-pop."
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="How was hyper-pop used?"))
+        repost = _source("https://example.org/fan-repost", artist_quote).model_copy(
+            update={"title": "Artist on the meaning of Hyperballad"}
+        )
+        repost_id = db.add_source(repost)
+        use_id = db.add_source(
+            _source("https://example.org/contemporary-review", term_quote).model_copy(
+                update={"title": "Music review"}
+            )
+        )
+        meaning_id = db.add_evidence(
+            Evidence(
+                source_id=repost_id,
+                research_question_id=qid,
+                exact_quote=artist_quote,
+                normalized_claim=artist_quote,
+                evidence_type="observed_usage",
+            )
+        )
+        usage_id = db.add_evidence(
+            Evidence(
+                source_id=use_id,
+                research_question_id=qid,
+                exact_quote=term_quote,
+                normalized_claim=term_quote,
+                evidence_type="observed_usage",
+                quote_verified_date="2014-10-01",
+                date_verification_note="Independently dated issue containing this text.",
+                primary_source_verified=True,
+            )
+        )
+        assert db.rows("SELECT evidence_type FROM evidence WHERE id=?", (meaning_id,))[0][0] == (
+            "attributed_intent"
+        )
+        db.conn.execute(
+            "UPDATE evidence SET evidence_type='observed_usage' WHERE id=?", (meaning_id,)
+        )
+        db.conn.commit()
+    with Database(path) as db:
+        rows = db.rows(
+            "SELECT id,source_id,evidence_type,primary_source_verified FROM evidence "
+            "WHERE id IN (?,?) ORDER BY id",
+            (meaning_id, usage_id),
+        )
+        assert [
+            (r["id"], r["source_id"], r["evidence_type"], r["primary_source_verified"])
+            for r in rows
+        ] == [
+            (meaning_id, repost_id, "attributed_intent", 0),
+            (usage_id, use_id, "observed_usage", 1),
+        ]
+
+
+def test_later_usage_reports_and_playlist_history_keep_attribution(tmp_path):
+    path = tmp_path / "research.db"
+    cases = [
+        ("They just called everything hyperpop back then.", "attributed_usage"),
+        (
+            "The Hyperpop playlist, which Spotify started in August 2019, began as a direct response to the group.",
+            "attributed_origin_claim",
+        ),
+        ("Spotify launched its hyperpop playlist in August 2019.", "attributed_origin_claim"),
+        (
+            "When we started it back in August 2019, we had seen a community growing online.",
+            "attributed_origin_claim",
+        ),
+        ("The artists made unusual music together.", "interpretive_context"),
+        ("This PC Music track is hyper-pop.", "observed_usage"),
+    ]
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="How was hyperpop used?"))
+        ids = []
+        for index, (quote, expected) in enumerate(cases):
+            sid = db.add_source(
+                _source(f"https://example.org/article-{index}", quote).model_copy(
+                    update={"title": "Hyperpop history"}
+                )
+            )
+            eid = db.add_evidence(
+                Evidence(
+                    source_id=sid,
+                    research_question_id=qid,
+                    exact_quote=quote,
+                    normalized_claim=quote,
+                    evidence_type="observed_usage",
+                    term_sense=TermSense.MODERN_GENRE,
+                    quote_verified_date="2021-01-01",
+                    date_verification_note="Dated copy of this article.",
+                    primary_source_verified=True,
+                )
+            )
+            assert (
+                db.rows("SELECT evidence_type FROM evidence WHERE id=?", (eid,))[0][0] == expected
+            )
+            ids.append((eid, sid, expected))
+        chronology = (
+            markdown_report(db, qid)
+            .split("## Verified chronology", 1)[1]
+            .split("## Evidence outside verified chronology", 1)[0]
+        )
+        assert "This PC Music track is hyper-pop." in chronology
+        assert "Spotify launched its hyperpop playlist" not in chronology
+        db.conn.execute("UPDATE evidence SET evidence_type='observed_usage'")
+        db.conn.commit()
+    with Database(path) as db:
+        assert [
+            (row["id"], row["source_id"], row["evidence_type"])
+            for row in db.rows("SELECT id,source_id,evidence_type FROM evidence ORDER BY id")
+        ] == ids
+
+
+def test_historical_run_recovery_is_guarded_audited_and_resumable(tmp_path):
+    path = tmp_path / "research.db"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where was hyperpop used?"))
+        interrupted = db.start_run(
+            ResearchRun(
+                research_question_id=qid,
+                model="test-model",
+                provider="test-provider",
+                started_at="2020-01-01T00:00:00+00:00",
+            )
+        )
+        db.record_action(interrupted, "fetch", "source_id=1")
+        with pytest.raises(ValueError, match="later completed run"):
+            db.mark_historical_run_interrupted(interrupted, interrupted, "Interrupted process")
+        successor = db.start_run(
+            ResearchRun(
+                research_question_id=qid,
+                model="test-model",
+                provider="test-provider",
+                started_at="2020-01-02T00:00:00+00:00",
+            )
+        )
+        with pytest.raises(ValueError, match="later completed run"):
+            db.mark_historical_run_interrupted(interrupted, successor, "Interrupted process")
+        db.finish_run(successor, "stopped", "max_actions")
+        assert db.mark_historical_run_interrupted(interrupted, successor, "Interrupted process")
+        assert not db.mark_historical_run_interrupted(interrupted, successor, "Interrupted process")
+    with Database(path) as db:
+        run = db.rows("SELECT * FROM runs WHERE id=?", (interrupted,))[0]
+        assert (run["status"], run["actions_taken"]) == ("interrupted", 1)
+        assert run["ended_at"] is not None
+        assert "actual stop time unknown" in run["stop_reason"]
+        audit = db.rows(
+            "SELECT action,detail FROM actions WHERE run_id=? AND action='run_state_recovery'",
+            (interrupted,),
+        )
+        assert len(audit) == 1
+        assert json.loads(audit[0]["detail"])["superseding_run_id"] == successor
+        assert db.rows("SELECT count(*) FROM runs WHERE status='running'")[0][0] == 0
+
+
 def test_direct_dated_usage_only_enters_verified_chronology(tmp_path):
     with Database(tmp_path / "research.db") as db:
         qid = db.add_question(ResearchQuestion(question="When was hyperpop directly used?"))
@@ -1088,7 +1246,7 @@ def test_direct_dated_usage_only_enters_verified_chronology(tmp_path):
         assert secondary not in chronology
         assert "1988" not in chronology
         assert "2014-06-01" in chronology
-        assert "### Origin and coinage claims" in report
+        assert "### Origin, naming, and launch claims" in report
         assert secondary in report
 
 

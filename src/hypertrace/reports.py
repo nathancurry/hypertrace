@@ -264,7 +264,7 @@ def markdown_report(db: Database, question_id: int) -> str:
     sections = (
         ("Other directly observed historical usage", "observed_usage"),
         ("Later attribution of historical usage", "attributed_usage"),
-        ("Origin and coinage claims", "attributed_origin_claim"),
+        ("Origin, naming, and launch claims", "attributed_origin_claim"),
         ("Attributed intent", "attributed_intent"),
         ("Interpretive commentary", "interpretive_context"),
     )

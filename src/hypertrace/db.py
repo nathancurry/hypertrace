@@ -253,23 +253,50 @@ _INTERPRETIVE_WORDS = re.compile(
 )
 _REPORTED_USE = re.compile(
     r"\b(?:was|were|had been)\s+(?:describing|using|used|calling|called)\b|"
+    r"\bthey\b.{0,30}\bcalled\b|"
     r"\b(?:used|described|called)\b.{0,100}\b(?:as early as|in (?:19|20)\d{2})\b|"
     r"\bas early as (?:19|20)\d{2}\b",
     re.IGNORECASE,
 )
+_REPORTED_EVENT = re.compile(
+    r"\b(?:started|launched|began)\b.{0,100}\b(?:back )?in "
+    r"(?:[A-Za-z]+ )?(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_HYPERPOP_TERM = re.compile(r"\bhyper[ -]?pop\b", re.IGNORECASE)
+_HYPERBALLAD_TERM = re.compile(r"\bhyper[ -]?ballad\b", re.IGNORECASE)
+_MEANING_HEADLINE = re.compile(
+    r"\b(?:on|about|explains?|explaining)\s+(?:the\s+)?meaning\s+of\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON = re.compile(r"\b(?:I|me|my|we|our)\b", re.IGNORECASE)
 
 
-def _correct_evidence_type(quote: str, proposed: str) -> str:
+def _correct_evidence_type(
+    quote: str, proposed: str, source_title: str = "", term_sense: str = "unknown"
+) -> str:
     if proposed != EpistemicType.OBSERVED_USAGE:
         return proposed
+    if _MEANING_HEADLINE.search(source_title) and _FIRST_PERSON.search(quote):
+        return EpistemicType.ATTRIBUTED_INTENT
     if _INTENT_WORDS.search(quote):
         return EpistemicType.ATTRIBUTED_INTENT
     if _ORIGIN_WORDS.search(quote):
+        return EpistemicType.ATTRIBUTED_ORIGIN_CLAIM
+    if _REPORTED_EVENT.search(quote):
         return EpistemicType.ATTRIBUTED_ORIGIN_CLAIM
     if _INTERPRETIVE_WORDS.search(quote):
         return EpistemicType.INTERPRETIVE_CONTEXT
     if _REPORTED_USE.search(quote):
         return EpistemicType.ATTRIBUTED_USAGE
+    if term_sense == "song_title" and not _HYPERBALLAD_TERM.search(quote):
+        return EpistemicType.INTERPRETIVE_CONTEXT
+    if term_sense in {
+        "modern_genre",
+        "earlier_unrelated_usage",
+        "retrospective_label",
+    } and not _HYPERPOP_TERM.search(quote):
+        return EpistemicType.INTERPRETIVE_CONTEXT
     return proposed
 
 
@@ -435,10 +462,17 @@ class Database:
                     "WHERE status!='open'"
                 )
             for row in self.conn.execute(
-                "SELECT id,source_id,research_question_id,exact_quote,evidence_type "
-                "FROM evidence WHERE evidence_type='observed_usage'"
+                "SELECT e.id,e.source_id,e.research_question_id,e.exact_quote,e.evidence_type,"
+                "e.term_sense,"
+                "s.title AS source_title FROM evidence e JOIN sources s ON s.id=e.source_id "
+                "WHERE e.evidence_type='observed_usage'"
             ).fetchall():
-                corrected = _correct_evidence_type(row["exact_quote"], row["evidence_type"])
+                corrected = _correct_evidence_type(
+                    row["exact_quote"],
+                    row["evidence_type"],
+                    row["source_title"],
+                    row["term_sense"],
+                )
                 if corrected == row["evidence_type"]:
                     continue
                 self.conn.execute(
@@ -1444,14 +1478,20 @@ class Database:
 
     def _add_evidence_tx(self, evidence: Evidence) -> int:
         source = self.conn.execute(
-            "SELECT content,regions_json,source_type FROM sources WHERE id=?", (evidence.source_id,)
+            "SELECT content,regions_json,source_type,title FROM sources WHERE id=?",
+            (evidence.source_id,),
         ).fetchone()
         quote_start = -1 if source is None else source["content"].find(evidence.exact_quote)
         if quote_start < 0:
             raise ValueError("Evidence quote must occur verbatim in the stored source text")
         if source["source_type"] == "search_aggregator":
             raise ValueError("Aggregator snippets cannot be evidence")
-        corrected_type = _correct_evidence_type(evidence.exact_quote, evidence.evidence_type.value)
+        corrected_type = _correct_evidence_type(
+            evidence.exact_quote,
+            evidence.evidence_type.value,
+            source["title"],
+            evidence.term_sense.value,
+        )
         if corrected_type != evidence.evidence_type.value:
             evidence = evidence.model_copy(update={"evidence_type": EpistemicType(corrected_type)})
         quote_end = quote_start + len(evidence.exact_quote)
@@ -2094,6 +2134,67 @@ class Database:
                 "UPDATE runs SET ended_at=?,status=?,stop_reason=? WHERE id=?",
                 (utc_now(), status, reason, run_id),
             )
+
+    def mark_historical_run_interrupted(
+        self, run_id: int, successor_run_id: int, reason: str
+    ) -> bool:
+        if not reason.strip():
+            raise ValueError("Run recovery needs an audit reason")
+        with self.conn:
+            run = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            successor = self.conn.execute(
+                "SELECT * FROM runs WHERE id=?", (successor_run_id,)
+            ).fetchone()
+            if run is None or successor is None:
+                raise ValueError("Run recovery needs both run records")
+            if run["status"] == "interrupted":
+                return False
+            if run["status"] != "running" or run["ended_at"] is not None:
+                raise ValueError("Only unfinished running runs can be recovered")
+            if (
+                successor["research_question_id"] != run["research_question_id"]
+                or successor["id"] <= run_id
+                or successor["started_at"] <= run["started_at"]
+                or successor["status"] not in {"stopped", "failed"}
+                or successor["ended_at"] is None
+            ):
+                raise ValueError("Run recovery needs a later completed run in this question")
+            if self.conn.execute(
+                "SELECT 1 FROM provider_attempts WHERE run_id=? AND ended_at IS NULL",
+                (run_id,),
+            ).fetchone():
+                raise ValueError("Run recovery needs closed provider attempts")
+            recovered_at = utc_now()
+            stop_reason = (
+                "Historical interruption; actual stop time unknown. "
+                f"Administratively closed after run {successor_run_id}. {reason.strip()}"
+            )
+            changed = self.conn.execute(
+                "UPDATE runs SET status='interrupted',ended_at=?,stop_reason=? "
+                "WHERE id=? AND status='running' AND ended_at IS NULL",
+                (recovered_at, stop_reason, run_id),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("Run state changed during recovery")
+            # Administrative audit events do not count as research actions.
+            self.conn.execute(
+                "INSERT INTO actions (run_id,occurred_at,action,detail) VALUES (?,?,?,?)",
+                (
+                    run_id,
+                    recovered_at,
+                    "run_state_recovery",
+                    json.dumps(
+                        {
+                            "previous_status": run["status"],
+                            "previous_ended_at": run["ended_at"],
+                            "new_status": "interrupted",
+                            "superseding_run_id": successor_run_id,
+                            "reason": reason.strip(),
+                        }
+                    ),
+                ),
+            )
+        return True
 
     def latest_question(self) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM questions ORDER BY id DESC LIMIT 1").fetchone()
