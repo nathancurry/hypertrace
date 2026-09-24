@@ -22,6 +22,15 @@ class Config:
     min_yield: float
     json_mode: bool
     local_usage_multiplier: float = 1.25
+    review_primary_base_url: str | None = None
+    review_primary_api_key: str | None = None
+    review_primary_input_cost_per_million: float | None = None
+    review_primary_output_cost_per_million: float | None = None
+    review_fallback_base_url: str | None = None
+    review_fallback_api_key: str | None = None
+    review_fallback_model: str | None = None
+    review_fallback_input_cost_per_million: float | None = None
+    review_fallback_output_cost_per_million: float | None = None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -39,6 +48,31 @@ class Config:
             min_yield=float(os.getenv("HYPERTRACE_MIN_YIELD", "0.05")),
             json_mode=os.getenv("LLM_JSON_MODE", "true").lower() == "true",
             local_usage_multiplier=float(os.getenv("HYPERTRACE_LOCAL_USAGE_MULTIPLIER", "1.25")),
+            review_primary_base_url=os.getenv("REVIEW_PRIMARY_BASE_URL") or None,
+            review_primary_api_key=os.getenv("REVIEW_PRIMARY_API_KEY") or None,
+            review_primary_input_cost_per_million=(
+                float(value)
+                if (value := os.getenv("REVIEW_PRIMARY_INPUT_COST_PER_MILLION"))
+                else None
+            ),
+            review_primary_output_cost_per_million=(
+                float(value)
+                if (value := os.getenv("REVIEW_PRIMARY_OUTPUT_COST_PER_MILLION"))
+                else None
+            ),
+            review_fallback_base_url=os.getenv("REVIEW_FALLBACK_BASE_URL") or None,
+            review_fallback_api_key=os.getenv("REVIEW_FALLBACK_API_KEY") or None,
+            review_fallback_model=os.getenv("REVIEW_FALLBACK_MODEL") or None,
+            review_fallback_input_cost_per_million=(
+                float(value)
+                if (value := os.getenv("REVIEW_FALLBACK_INPUT_COST_PER_MILLION"))
+                else None
+            ),
+            review_fallback_output_cost_per_million=(
+                float(value)
+                if (value := os.getenv("REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION"))
+                else None
+            ),
         )
 
     def require_online(self, max_cost: float | None = None) -> None:
@@ -48,6 +82,32 @@ class Config:
             raise ValueError("Set LLM_API_KEY for research runs")
         if not self.brave_api_key:
             raise ValueError("Set BRAVE_SEARCH_API_KEY for research runs")
+        if bool(self.review_primary_base_url) != bool(self.review_primary_api_key):
+            raise ValueError("Set both REVIEW_PRIMARY_BASE_URL and REVIEW_PRIMARY_API_KEY")
+        if bool(self.review_fallback_base_url) != bool(self.review_fallback_api_key):
+            raise ValueError("Set both REVIEW_FALLBACK_BASE_URL and REVIEW_FALLBACK_API_KEY")
+        if self.review_fallback_base_url and (
+            self.review_primary_input_cost_per_million is None
+            or self.review_primary_output_cost_per_million is None
+        ):
+            raise ValueError("Set REVIEW_PRIMARY_*_COST_PER_MILLION for review failover")
+        if self.review_fallback_base_url and (
+            self.review_fallback_input_cost_per_million is None
+            or self.review_fallback_output_cost_per_million is None
+            or not math.isfinite(self.review_fallback_input_cost_per_million)
+            or not math.isfinite(self.review_fallback_output_cost_per_million)
+            or self.review_fallback_input_cost_per_million < 0
+            or self.review_fallback_output_cost_per_million < 0
+        ):
+            raise ValueError("Set REVIEW_FALLBACK_*_COST_PER_MILLION for fallback billing")
+        if any(
+            rate is not None and (not math.isfinite(rate) or rate < 0)
+            for rate in (
+                self.review_primary_input_cost_per_million,
+                self.review_primary_output_cost_per_million,
+            )
+        ):
+            raise ValueError("Review primary costs must be nonnegative")
         if max_cost is not None and (
             self.input_cost_per_million <= 0 or self.output_cost_per_million <= 0
         ):

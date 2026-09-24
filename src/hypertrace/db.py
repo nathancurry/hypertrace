@@ -191,6 +191,11 @@ CREATE TABLE IF NOT EXISTS provider_attempts (
   local_output_tokens INTEGER,
   local_estimated_cost REAL,
   provider_billing_unknown INTEGER NOT NULL DEFAULT 1,
+  provider TEXT,
+  provider_role TEXT,
+  attempt_order INTEGER,
+  retry_reason TEXT,
+  http_status INTEGER,
   diagnostics_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_question ON evidence(research_question_id);
@@ -309,6 +314,11 @@ class Database:
                 "local_output_tokens": "INTEGER",
                 "local_estimated_cost": "REAL",
                 "provider_billing_unknown": "INTEGER NOT NULL DEFAULT 1",
+                "provider": "TEXT",
+                "provider_role": "TEXT",
+                "attempt_order": "INTEGER",
+                "retry_reason": "TEXT",
+                "http_status": "INTEGER",
             },
         }
         legacy_evidence = "quote_region" not in {
@@ -1674,14 +1684,33 @@ class Database:
                 )
 
     def start_provider_attempt(
-        self, run_id: int, action: str, model: str, local_input_tokens: int
+        self,
+        run_id: int,
+        action: str,
+        model: str,
+        local_input_tokens: int,
+        provider: str | None = None,
+        provider_role: str | None = None,
+        attempt_order: int | None = None,
+        retry_reason: str | None = None,
     ) -> int:
         with self.conn:
             cursor = self.conn.execute(
                 "INSERT INTO provider_attempts "
-                "(run_id,logical_action,model,started_at,outcome,local_input_tokens) "
-                "VALUES (?,?,?,?,?,?)",
-                (run_id, action, model, utc_now(), "in_flight", local_input_tokens),
+                "(run_id,logical_action,model,started_at,outcome,local_input_tokens,"
+                "provider,provider_role,attempt_order,retry_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    action,
+                    model,
+                    utc_now(),
+                    "in_flight",
+                    local_input_tokens,
+                    provider,
+                    provider_role,
+                    attempt_order,
+                    retry_reason,
+                ),
             )
             self.conn.execute(
                 "UPDATE runs SET provider_requests=provider_requests+1,"
@@ -1722,7 +1751,8 @@ class Database:
             self.conn.execute(
                 "UPDATE provider_attempts SET ended_at=?,outcome=?,input_tokens=?,"
                 "output_tokens=?,estimated_cost=?,usage_reported=?,local_output_tokens=?,"
-                "local_estimated_cost=?,provider_billing_unknown=?,diagnostics_json=? WHERE id=?",
+                "local_estimated_cost=?,provider_billing_unknown=?,diagnostics_json=?,"
+                "http_status=? WHERE id=?",
                 (
                     utc_now(),
                     outcome,
@@ -1734,6 +1764,7 @@ class Database:
                     local_cost,
                     int(not known),
                     json.dumps(diagnostics or {}),
+                    (diagnostics or {}).get("http_status"),
                     attempt_id,
                 ),
             )

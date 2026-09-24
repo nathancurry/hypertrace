@@ -164,11 +164,47 @@ class _AttemptLogger:
     def __init__(self, researcher: Researcher, action: str):
         self.researcher = researcher
         self.action = action
+        self.rates: dict[int, tuple[float, float]] = {}
 
-    def started(self, model: str, local_input_tokens: int) -> int:
-        return self.researcher.db.start_provider_attempt(
-            self.researcher.run_id, self.action, model, local_input_tokens
+    def started(
+        self,
+        model: str,
+        local_input_tokens: int,
+        provider: str = "unknown",
+        role: str = "primary",
+        attempt_order: int = 1,
+        retry_reason: str = "initial",
+    ) -> int:
+        researcher = self.researcher
+        attempt_id = researcher.db.start_provider_attempt(
+            researcher.run_id,
+            self.action,
+            model,
+            local_input_tokens,
+            provider,
+            role,
+            attempt_order,
+            retry_reason,
         )
+        config = researcher.config
+        rates = (config.input_cost_per_million, config.output_cost_per_million)
+        if self.action == "review":
+            if role == "fallback":
+                rates = (
+                    config.review_fallback_input_cost_per_million,
+                    config.review_fallback_output_cost_per_million,
+                )
+            else:
+                rates = (
+                    config.input_cost_per_million
+                    if config.review_primary_input_cost_per_million is None
+                    else config.review_primary_input_cost_per_million,
+                    config.output_cost_per_million
+                    if config.review_primary_output_cost_per_million is None
+                    else config.review_primary_output_cost_per_million,
+                )
+        self.rates[attempt_id] = rates
+        return attempt_id
 
     def finished(
         self,
@@ -180,13 +216,14 @@ class _AttemptLogger:
         diagnostics: dict,
     ) -> None:
         researcher = self.researcher
+        input_rate, output_rate = self.rates.pop(attempt_id)
         cost = researcher.db.finish_provider_attempt(
             attempt_id,
             outcome,
             input_tokens,
             output_tokens,
-            researcher.config.input_cost_per_million,
-            researcher.config.output_cost_per_million,
+            input_rate,
+            output_rate,
             local_output_tokens,
             researcher.config.local_usage_multiplier,
             diagnostics,
@@ -223,9 +260,13 @@ class Researcher:
         limits: Limits,
         model: str | None = None,
         archive: Wayback | None = None,
+        review_primary: OpenAICompatibleLLM | None = None,
+        review_fallback: OpenAICompatibleLLM | None = None,
     ):
         self.db = db
         self.llm = llm
+        self.review_primary = review_primary
+        self.review_fallback = review_fallback
         self.retrieval = retrieval
         self.archive = (
             archive
@@ -255,10 +296,15 @@ class Researcher:
     def _safe_completion_error(self, exc: Exception) -> str:
         if isinstance(exc, httpx.HTTPStatusError):
             return f"HTTP {exc.response.status_code}"
-        if isinstance(self.llm, OpenAICompatibleLLM) and isinstance(exc, StructuredOutputError):
+        if isinstance(exc, StructuredOutputError):
             message = str(exc)
-            if self.config.llm_api_key:
-                message = message.replace(self.config.llm_api_key, "[redacted]")
+            for secret in (
+                self.config.llm_api_key,
+                self.config.review_primary_api_key,
+                self.config.review_fallback_api_key,
+            ):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
             return f"{type(exc).__name__}: {message[:300]}"
         return type(exc).__name__
 
@@ -314,7 +360,9 @@ class Researcher:
 
     async def _complete(self, action: str, model: str, system: str, user: str, schema: type):
         self._check()
-        provider_tracked = isinstance(self.llm, OpenAICompatibleLLM)
+        llm = (self.review_primary or self.llm) if action == "review" else self.llm
+        fallback = self.review_fallback if action == "review" else None
+        provider_tracked = isinstance(llm, OpenAICompatibleLLM)
         if self.limits.max_cost is not None:
             prompt_bytes = (
                 len(system.encode())
@@ -322,29 +370,54 @@ class Researcher:
                 + len(json.dumps(schema.model_json_schema()).encode())
                 + 1024
             )
-            attempts = getattr(self.llm, "max_retries", 0) + 1
+            attempts = getattr(llm, "max_retries", 0) + 1
             if provider_tracked:
                 attempts += 1  # One possible schema correction request.
             max_output_tokens = (
-                self.llm.structured_call_policy(model).max_completion_tokens
+                llm.structured_call_policy(model).max_completion_tokens
                 if provider_tracked
                 else 1500
             )
+            primary_input_rate = self.config.input_cost_per_million
+            primary_output_rate = self.config.output_cost_per_million
+            if action == "review":
+                if self.config.review_primary_input_cost_per_million is not None:
+                    primary_input_rate = self.config.review_primary_input_cost_per_million
+                if self.config.review_primary_output_cost_per_million is not None:
+                    primary_output_rate = self.config.review_primary_output_cost_per_million
             reserve = (
                 attempts
-                * (
-                    prompt_bytes * self.config.input_cost_per_million
-                    + max_output_tokens * self.config.output_cost_per_million
-                )
+                * (prompt_bytes * primary_input_rate + max_output_tokens * primary_output_rate)
                 / 1_000_000
             )
+            if fallback:
+                reserve += (
+                    (fallback.max_retries + 1)
+                    * (
+                        prompt_bytes * self.config.review_fallback_input_cost_per_million
+                        + max_output_tokens * self.config.review_fallback_output_cost_per_million
+                    )
+                    / 1_000_000
+                )
             if self.cost + reserve > self.limits.max_cost:
                 raise BudgetStop("max_cost")
         if provider_tracked:
-            self.llm.attempt_observer = _AttemptLogger(self, action)
+            llm.attempt_observer = _AttemptLogger(self, action)
         try:
+            call = (
+                llm.complete(
+                    model,
+                    system,
+                    user,
+                    schema,
+                    fallback=fallback,
+                    fallback_model=self.config.review_fallback_model,
+                )
+                if fallback
+                else llm.complete(model, system, user, schema)
+            )
             result = await asyncio.wait_for(
-                self.llm.complete(model, system, user, schema),
+                call,
                 timeout=max(0.001, self.deadline - time.monotonic()),
             )
         except TimeoutError as exc:
@@ -361,7 +434,7 @@ class Researcher:
             raise
         finally:
             if provider_tracked:
-                self.llm.attempt_observer = None
+                llm.attempt_observer = None
         self._record(
             action,
             json.dumps(

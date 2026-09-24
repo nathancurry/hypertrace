@@ -67,6 +67,24 @@ def _question_id(db: Database, requested: int | None) -> int:
 async def _run(db: Database, config: Config, args: argparse.Namespace, question_id: int) -> int:
     config.require_online(args.max_cost)
     llm = OpenAICompatibleLLM(config.llm_base_url, config.llm_api_key, json_mode=config.json_mode)
+    review_primary = (
+        OpenAICompatibleLLM(
+            config.review_primary_base_url,
+            config.review_primary_api_key,
+            json_mode=config.json_mode,
+        )
+        if config.review_primary_base_url
+        else None
+    )
+    review_fallback = (
+        OpenAICompatibleLLM(
+            config.review_fallback_base_url,
+            config.review_fallback_api_key,
+            json_mode=config.json_mode,
+        )
+        if config.review_fallback_base_url
+        else None
+    )
     web = BraveWeb(config.brave_api_key)
     try:
         limits = Limits(
@@ -75,9 +93,23 @@ async def _run(db: Database, config: Config, args: argparse.Namespace, question_
             max_minutes=args.max_minutes,
             min_yield=args.min_yield if args.min_yield is not None else config.min_yield,
         )
-        return await Researcher(db, llm, web, config, question_id, limits, args.model).run()
+        return await Researcher(
+            db,
+            llm,
+            web,
+            config,
+            question_id,
+            limits,
+            args.model,
+            review_primary=review_primary,
+            review_fallback=review_fallback,
+        ).run()
     finally:
         await llm.aclose()
+        if review_primary:
+            await review_primary.aclose()
+        if review_fallback:
+            await review_fallback.aclose()
         await web.aclose()
 
 

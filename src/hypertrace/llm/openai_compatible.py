@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
+import random
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -21,7 +25,15 @@ PREVIEW_END_CHARS = 160
 
 
 class AttemptObserver(Protocol):
-    def started(self, model: str, local_input_tokens: int) -> int: ...
+    def started(
+        self,
+        model: str,
+        local_input_tokens: int,
+        provider: str,
+        role: str,
+        attempt_order: int,
+        retry_reason: str,
+    ) -> int: ...
 
     def finished(
         self,
@@ -144,6 +156,23 @@ def _repair_messages(schema_text: str, content: str, error: str) -> list[dict[st
     ]
 
 
+def _rate_limit_delay(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            seconds = float(retry_after)
+            if math.isfinite(seconds):
+                return max(0.25, seconds)
+        except ValueError:
+            pass
+        try:
+            date = parsedate_to_datetime(retry_after)
+            return max(0.25, (date - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return min(8.0, 2.0 ** (attempt - 1)) * (1 + random.uniform(0, 0.25))
+
+
 class OpenAICompatibleLLM:
     def __init__(
         self,
@@ -175,8 +204,16 @@ class OpenAICompatibleLLM:
         if self._owns_client:
             await self.client.aclose()
 
-    async def complete(self, model: str, system: str, user: str, schema: type[T]) -> LLMResult[T]:
-        policy = self.structured_call_policy(model)
+    async def complete(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        schema: type[T],
+        *,
+        fallback: OpenAICompatibleLLM | None = None,
+        fallback_model: str | None = None,
+    ) -> LLMResult[T]:
         schema_text = json.dumps(schema.model_json_schema(), separators=(",", ":"))
         messages = [
             {
@@ -189,44 +226,71 @@ class OpenAICompatibleLLM:
         input_tokens = 0
         output_tokens = 0
         repair_pending = False
-        for attempt in range(self.max_retries + 2):
+        provider = self
+        provider_attempt = 0
+        rate_limits = 0
+        retry_reason = "initial"
+        primary_attempts = max(2, self.max_retries + 1) if fallback else self.max_retries + 1
+        max_attempts = primary_attempts + 1 + (fallback.max_retries + 1 if fallback else 0)
+        for attempt in range(max_attempts):
+            provider_attempt += 1
             is_repair = repair_pending
             attempt_kind = "repair" if is_repair else "initial" if attempt == 0 else "retry"
+            selected_model = (fallback_model or model) if provider is fallback else model
+            policy = provider.structured_call_policy(selected_model)
             body: dict = {
-                "model": model,
+                "model": selected_model,
                 "messages": messages,
                 "temperature": 0,
             }
             body["max_completion_tokens"] = policy.max_completion_tokens
-            if self.json_mode:
+            if provider.json_mode:
                 body["response_format"] = {"type": "json_object"}
             if policy.reasoning_effort:
                 body["reasoning_effort"] = policy.reasoning_effort
-            request = self.client.build_request(
+            request = provider.client.build_request(
                 "POST",
-                f"{self.base_url}/chat/completions",
+                f"{provider.base_url}/chat/completions",
                 json=body,
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers={"Authorization": f"Bearer {provider.api_key}"},
                 timeout=policy.timeout_seconds,
             )
             local_input_tokens = math.ceil(len(request.content) / 4)
             local_output_tokens = 0
             observer = self.attempt_observer
-            attempt_id = observer.started(model, local_input_tokens) if observer else None
+            role = "fallback" if provider is fallback else "primary"
+            identity = urlsplit(provider.base_url).hostname or "unknown"
+            attempt_id = (
+                observer.started(
+                    selected_model, local_input_tokens, identity, role, attempt + 1, retry_reason
+                )
+                if observer
+                else None
+            )
             attempt_input: int | None = None
             attempt_output: int | None = None
             outcome = "unknown_failure"
-            diagnostics: dict = _response_diagnostics(None, None, self.api_key)
+            diagnostics: dict = _response_diagnostics(None, None, provider.api_key)
             diagnostics["attempt_kind"] = attempt_kind
             diagnostics["local_input_tokens"] = local_input_tokens
+            diagnostics["provider"] = identity
+            diagnostics["provider_role"] = role
+            diagnostics["attempt_order"] = attempt + 1
+            diagnostics["retry_reason"] = retry_reason
+            retry_delay: float | None = None
+            http_status: int | None = None
             try:
-                response = await self.client.send(request)
+                response = await provider.client.send(request)
                 try:
                     payload = response.json()
                 except json.JSONDecodeError:
                     payload = None
-                diagnostics = _response_diagnostics(response.status_code, payload, self.api_key)
+                diagnostics = _response_diagnostics(response.status_code, payload, provider.api_key)
                 diagnostics["attempt_kind"] = attempt_kind
+                diagnostics["provider"] = identity
+                diagnostics["provider_role"] = role
+                diagnostics["attempt_order"] = attempt + 1
+                diagnostics["retry_reason"] = retry_reason
                 diagnostics["max_completion_tokens"] = policy.max_completion_tokens
                 diagnostics["reasoning_effort_requested"] = policy.reasoning_effort
                 if isinstance(payload, dict):
@@ -323,7 +387,7 @@ class OpenAICompatibleLLM:
                     value=value,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    model=payload.get("model", model),
+                    model=payload.get("model", selected_model),
                 )
             except StructuredOutputError as exc:
                 last_error = exc
@@ -358,10 +422,19 @@ class OpenAICompatibleLLM:
                 last_error = exc
                 outcome = "transport_failure"
             except httpx.HTTPStatusError as exc:
-                outcome = f"http_{exc.response.status_code}"
-                if exc.response.status_code not in (429, 500, 502, 503, 504):
+                http_status = exc.response.status_code
+                outcome = f"http_{http_status}"
+                if http_status not in (429, 500, 502, 503, 504):
                     raise
                 last_error = exc
+                if http_status == 429:
+                    rate_limits += 1 if provider is self else 0
+                    limit = primary_attempts if provider is self else provider.max_retries + 1
+                    if provider_attempt < limit and not (
+                        provider is self and fallback and rate_limits >= 2
+                    ):
+                        retry_delay = _rate_limit_delay(exc.response, provider_attempt)
+                        diagnostics["retry_delay_seconds"] = retry_delay
             finally:
                 diagnostics["local_output_tokens"] = local_output_tokens
                 logger.info(
@@ -378,7 +451,21 @@ class OpenAICompatibleLLM:
                     )
             if is_repair:
                 break
-            if repair_pending or attempt < self.max_retries:
+            if repair_pending:
+                retry_reason = "schema_repair"
+                continue
+            if http_status == 429 and provider is self and fallback and rate_limits >= 2:
+                provider = fallback
+                provider_attempt = 0
+                retry_reason = "failover_after_rate_limit"
+                continue
+            limit = primary_attempts if provider is self else provider.max_retries + 1
+            if provider_attempt < limit:
+                if retry_delay is not None:
+                    await asyncio.sleep(retry_delay)
+                    retry_reason = "retry_after_rate_limit"
+                else:
+                    retry_reason = "retry_after_provider_failure"
                 continue
             break
         raise StructuredOutputError(
