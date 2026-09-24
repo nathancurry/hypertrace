@@ -97,8 +97,15 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     pending = db.rows(
-        "SELECT id,query,rationale,gap,information_value FROM queries WHERE research_question_id=? "
-        "AND status='active' ORDER BY priority DESC,id LIMIT 15",
+        "SELECT q.id,q.query,q.rationale,q.gap,q.information_value,"
+        "t.key AS source_target FROM queries q LEFT JOIN source_targets t "
+        "ON t.id=q.source_target_id WHERE q.research_question_id=? "
+        "AND q.status='active' ORDER BY q.priority DESC,q.id LIMIT 15",
+        (question_id,),
+    )
+    source_targets = db.rows(
+        "SELECT key,description,status FROM source_targets WHERE research_question_id=? "
+        "ORDER BY id",
         (question_id,),
     )
     frontier_counts = {
@@ -384,11 +391,19 @@ def markdown_report(db: Database, question_id: int) -> str:
     )
     if pending:
         for query in pending:
+            target = f" [target: {query['source_target']}]" if query["source_target"] else ""
             lines.append(
-                f"- Q{query['id']} `{query['query']}` [{query['information_value']}] — {_cell(query['gap'])}"
+                f"- Q{query['id']} `{query['query']}` [{query['information_value']}]"
+                f"{target} — {_cell(query['gap'])}"
             )
     else:
         lines.append("- No active searches recorded.")
+    if source_targets:
+        lines.extend(["", "### Source targets", ""])
+        for target in source_targets:
+            lines.append(
+                f"- `{target['key']}` [{target['status']}] — {_cell(target['description'])}"
+            )
     lines.extend(["", "### Deferred leads", ""])
     for query in deferred:
         lines.append(f"- Q{query['id']} `{query['query']}` — {_cell(query['rationale'])}")

@@ -29,6 +29,77 @@ SEED_QUERIES = [
     '"hyperpop" etymology genre term',
 ]
 
+SOURCE_TARGETS = [
+    (
+        "pc-music-2014",
+        "Original 2014 text applying hyperpop or hyper-pop to PC Music; especially the attributed Philip Sherburne Pitchfork article at pitchfork.com/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual/ and the source Glenn McDonald recalls. This URL remains unresolved.",
+    ),
+    (
+        "bjork-transmission",
+        "Pre-2019 primary text explicitly linking Björk or Hyperballad to the hyperpop term or its naming; archive-only leads remain unresolved.",
+    ),
+    (
+        "hyperballad-title",
+        "Björk's own explanation of the title Hyperballad in an interview, liner note, contemporary press, or official publication.",
+    ),
+    (
+        "spotify-naming",
+        "Direct Glenn McDonald, Spotify, or Lizzy Szabo account of the term's source, metadata entry, and playlist naming.",
+    ),
+    (
+        "scene-2014-2018",
+        "Dated 2014–2018 PC Music-adjacent primary usage in music press, blogs, interviews, Tumblr, or forums, including spelling variants.",
+    ),
+]
+
+TARGET_QUERIES = [
+    (
+        "pc-music-2014",
+        'site:pitchfork.com/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual/ "hyper-pop"',
+    ),
+    ("pc-music-2014", '"PC Music’s Twisted Electronic Pop" "Philip Sherburne" 2014'),
+    (
+        "pc-music-2014",
+        'web.archive.org "485-pc-musics-twisted-electronic-pop-a-users-manual" "hyper-pop"',
+    ),
+    ("bjork-transmission", '"Hyperballad" "hyperpop" "PC Music" before:2019'),
+    ("bjork-transmission", '"Björk" "hyper-pop" "Hyperballad" site:pitchfork.com before:2019'),
+    ("bjork-transmission", '"Hyperballad" "hyper pop" naming site:reddit.com before:2019'),
+    ("hyperballad-title", '"Hyperballad" "title" "Björk" interview 1995'),
+    ("hyperballad-title", 'site:bjork.com "Hyperballad" "title" interview'),
+    ("hyperballad-title", 'web.archive.org "Björk" "Hyperballad" "called" interview 1995'),
+    ("spotify-naming", '"Glenn McDonald" "hyperpop" "PC Music" "2014" interview'),
+    ("spotify-naming", 'site:everynoise.com "hyperpop" "PC Music" metadata 2018'),
+    ("spotify-naming", '"Lizzy Szabo" "terms being thrown around" "hyperpop"'),
+    ("scene-2014-2018", 'site:pitchfork.com "PC Music" "hyper-pop" 2015 OR 2016 OR 2017 OR 2018'),
+    ("scene-2014-2018", 'site:tumblr.com "PC Music" "hyperpop" 2014 OR 2015 OR 2016'),
+    (
+        "scene-2014-2018",
+        'site:reddit.com/r/pcmusic "hyper pop" OR "hyper-pop" 2015 OR 2016 OR 2017 OR 2018',
+    ),
+]
+
+
+def seed_source_targets(db: Database, question_id: int) -> None:
+    db.install_source_targets(
+        question_id,
+        SOURCE_TARGETS,
+        [
+            SearchQuery(
+                research_question_id=question_id,
+                query=text,
+                rationale="Locate contemporaneous or direct primary text for this unresolved source target.",
+                gap=next(description for name, description in SOURCE_TARGETS if name == key),
+                information_value="high",
+                novelty="Focused source, venue, wording, or archive variant.",
+                admission_basis="primary_source",
+                source_target=key,
+                generated_by="source-target-seed",
+            )
+            for key, text in TARGET_QUERIES
+        ],
+    )
+
 
 def seed_motivating_case(db: Database) -> int:
     existing = db.rows("SELECT id FROM questions WHERE question=?", (MOTIVATING_QUESTION,))
@@ -67,6 +138,10 @@ information_value (high/medium/low), novelty (how it differs from executed and p
 searches), and admission_basis (unresolved_gap, hypothesis_distinction, primary_source,
 or new_avenue). Prefer the original source behind an attributed claim. Avoid paraphrases
 and retrospective recaps. Return no queries when the remaining avenues are exhausted.
+When source_targets are supplied, each query must name one unresolved target key in
+source_target. Search for its underlying primary text using quoted wording, author,
+publication, date, site, title, archive, and spelling variants. Avoid generic
+"hyperpop history", "origin of hyperpop", or "what is hyperpop" searches.
 Return structured JSON only."""
 
 ASSESS_SYSTEM = """You extract source-grounded historical evidence. Use ONLY the fetched page
@@ -95,6 +170,7 @@ For every new query give gap, information_value (high/medium/low), novelty relat
 the existing frontier, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Seek the original text behind attributed claims first.
 Do not propose restatements of existing searches.
+When source_targets are supplied, set source_target to an unresolved target key.
 Return structured JSON only."""
 
 INTERPRET_SYSTEM = """Interpret persisted evidence conservatively. Do not invent facts.
@@ -122,8 +198,9 @@ outside the schema. Use at most 3 short items in each concern or test list, and 
 next_queries. Each query needs gap, information_value (high/medium/low), novelty
 relative to prior searches, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Prefer original sources behind attributed claims.
+When source_targets are supplied, set source_target to an unresolved target key.
 For exhausted_avenues, copy exactly one avenue_id from the supplied avenues list or
 reviewed_query.avenue_id per item,
 with a concrete reason, only when adequately answered or repeated searches produced no evidence.
 Never combine IDs or write a description in avenue_id. Use empty lists when there is no
-supported finding."""
+supported finding. Do not retire a source target after failed or unindexed searches."""

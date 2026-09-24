@@ -11,7 +11,16 @@ from datetime import date
 from pathlib import Path
 from typing import Self
 
-from hypertrace.frontier import avenue, legacy_value, overlap, priority
+from hypertrace.frontier import (
+    TARGET_ACTIVE_LIMIT,
+    TARGET_RANK,
+    avenue,
+    generic_query,
+    legacy_value,
+    overlap,
+    priority,
+    target_priority,
+)
 from hypertrace.models import (
     EpistemicType,
     Evidence,
@@ -44,6 +53,13 @@ CREATE TABLE IF NOT EXISTS research_notes (
   kind TEXT NOT NULL CHECK(kind IN ('lead','gap','reliability','adjudication','overlap')),
   statement TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_targets (
+  id INTEGER PRIMARY KEY,
+  research_question_id INTEGER NOT NULL REFERENCES questions(id),
+  key TEXT NOT NULL, description TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'unresolved' CHECK(status IN ('unresolved','resolved')),
+  UNIQUE(research_question_id,key)
+);
 CREATE TABLE IF NOT EXISTS queries (
   id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
   query TEXT NOT NULL, rationale TEXT NOT NULL, generated_by TEXT NOT NULL,
@@ -53,6 +69,7 @@ CREATE TABLE IF NOT EXISTS queries (
   admission_basis TEXT NOT NULL DEFAULT 'unresolved_gap',
   avenue TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 0,
   duplicate_of INTEGER REFERENCES queries(id),
+  source_target_id INTEGER REFERENCES source_targets(id),
   UNIQUE(research_question_id, query)
 );
 CREATE TABLE IF NOT EXISTS exhausted_avenues (
@@ -221,6 +238,7 @@ class Database:
                 "avenue": "TEXT NOT NULL DEFAULT ''",
                 "priority": "INTEGER NOT NULL DEFAULT 0",
                 "duplicate_of": "INTEGER REFERENCES queries(id)",
+                "source_target_id": "INTEGER REFERENCES source_targets(id)",
             },
             "hypotheses": {"archived_at": "TEXT"},
             "sources": {
@@ -521,13 +539,30 @@ class Database:
         with self.conn:
             return self._add_query_tx(query)
 
+    def install_source_targets(
+        self, question_id: int, targets: list[tuple[str, str]], queries: list[SearchQuery]
+    ) -> None:
+        """Install a focused source hunt without changing executed research records."""
+        with self.conn:
+            if not self.conn.execute(
+                "SELECT 1 FROM questions WHERE id=?", (question_id,)
+            ).fetchone():
+                raise ValueError("Unknown research question")
+            for key, description in targets:
+                if key not in TARGET_RANK:
+                    raise ValueError("Unknown source target key")
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO source_targets "
+                    "(research_question_id,key,description) VALUES (?,?,?)",
+                    (question_id, key, description),
+                )
+            for query in queries:
+                if query.research_question_id != question_id or query.source_target is None:
+                    raise ValueError("Seed query needs a source target in this question")
+                self._add_query_tx(query)
+            self._enforce_frontier_cap_tx(question_id)
+
     def _add_query_tx(self, query: SearchQuery, *, proposed: bool = False) -> int:
-        row = self.conn.execute(
-            "SELECT id FROM queries WHERE research_question_id=? AND query=?",
-            (query.research_question_id, query.query),
-        ).fetchone()
-        if row:
-            return int(row["id"])
         if proposed and not (query.gap.strip() and query.novelty.strip()):
             raise ValueError("Proposed query requires an unresolved gap and novelty explanation")
         if query.information_value not in {"high", "medium", "low"}:
@@ -539,8 +574,44 @@ class Database:
             "new_avenue",
         }:
             raise ValueError("Invalid admission basis")
+        target_id = None
+        if query.source_target is not None:
+            target = self.conn.execute(
+                "SELECT id FROM source_targets WHERE research_question_id=? AND key=? "
+                "AND status='unresolved'",
+                (query.research_question_id, query.source_target),
+            ).fetchone()
+            if target is None:
+                raise ValueError("Unknown or resolved source target")
+            target_id = int(target["id"])
         key = avenue(query.query)
-        score = priority(query.information_value, query.query, query.admission_basis)
+        score = (
+            target_priority(query.source_target, query.query, query.information_value)
+            if query.source_target is not None
+            else priority(query.information_value, query.query, query.admission_basis)
+        )
+        row = self.conn.execute(
+            "SELECT id,source_target_id,executed_at,status,priority FROM queries "
+            "WHERE research_question_id=? AND query=?",
+            (query.research_question_id, query.query),
+        ).fetchone()
+        if row:
+            if target_id is not None:
+                if row["source_target_id"] not in (None, target_id):
+                    raise ValueError("Query already belongs to another source target")
+                status = (
+                    "deferred"
+                    if row["executed_at"] is None
+                    and row["status"] in {"rejected_duplicate", "exhausted"}
+                    else row["status"]
+                )
+                self.conn.execute(
+                    "UPDATE queries SET source_target_id=?,priority=?,status=?,duplicate_of=NULL "
+                    "WHERE id=?",
+                    (target_id, max(score, row["priority"]), status, row["id"]),
+                )
+                self._enforce_frontier_cap_tx(query.research_question_id)
+            return int(row["id"])
         exhausted = self.conn.execute(
             "SELECT 1 FROM exhausted_avenues WHERE research_question_id=? AND avenue=?",
             (query.research_question_id, key),
@@ -550,20 +621,24 @@ class Database:
             "AND status!='rejected_duplicate' ORDER BY priority DESC,id",
             (query.research_question_id,),
         ).fetchall()
-        duplicate = next(
-            (
-                old
-                for old in existing
-                if overlap(query.query, old["query"])
-                and (
-                    old["status"] != "executed"
-                    or query.admission_basis != "primary_source"
-                    or self._query_has_primary_evidence(old["id"])
-                )
-            ),
-            None,
+        duplicate = (
+            None
+            if target_id
+            else next(
+                (
+                    old
+                    for old in existing
+                    if overlap(query.query, old["query"])
+                    and (
+                        old["status"] != "executed"
+                        or query.admission_basis != "primary_source"
+                        or self._query_has_primary_evidence(old["id"])
+                    )
+                ),
+                None,
+            )
         )
-        if exhausted:
+        if exhausted and target_id is None:
             status = "exhausted"
         elif duplicate and duplicate["priority"] >= score:
             status = "rejected_duplicate"
@@ -573,8 +648,8 @@ class Database:
             status = "active"
         cursor = self.conn.execute(
             "INSERT INTO queries (research_question_id,query,rationale,generated_by,created_at,"
-            "executed_at,status,gap,information_value,novelty,admission_basis,avenue,priority,duplicate_of) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "executed_at,status,gap,information_value,novelty,admission_basis,avenue,priority,"
+            "duplicate_of,source_target_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 query.research_question_id,
                 query.query,
@@ -590,6 +665,7 @@ class Database:
                 key,
                 score,
                 duplicate["id"] if status == "rejected_duplicate" else None,
+                target_id,
             ),
         )
         query_id = int(cursor.lastrowid)
@@ -612,6 +688,38 @@ class Database:
         )
 
     def _enforce_frontier_cap_tx(self, question_id: int) -> None:
+        targets = self.conn.execute(
+            "SELECT id,status FROM source_targets WHERE research_question_id=?",
+            (question_id,),
+        ).fetchall()
+        if targets:
+            unresolved = {row["id"] for row in targets if row["status"] == "unresolved"}
+            rows = self.conn.execute(
+                "SELECT q.id,q.source_target_id,q.query,q.information_value FROM queries q "
+                "WHERE q.research_question_id=? "
+                "AND q.executed_at IS NULL AND q.status IN ('active','deferred') "
+                "ORDER BY q.priority DESC,q.id",
+                (question_id,),
+            ).fetchall()
+            used: dict[int, int] = {}
+            active_count = 0
+            for row in rows:
+                target_id = row["source_target_id"]
+                active = (
+                    target_id in unresolved
+                    and row["information_value"] != "low"
+                    and not generic_query(row["query"])
+                    and used.get(target_id, 0) < TARGET_ACTIVE_LIMIT
+                    and active_count < self.active_query_limit
+                )
+                if active:
+                    used[target_id] = used.get(target_id, 0) + 1
+                    active_count += 1
+                self.conn.execute(
+                    "UPDATE queries SET status=? WHERE id=?",
+                    ("active" if active else "deferred", row["id"]),
+                )
+            return
         active = self.conn.execute(
             "SELECT id FROM queries WHERE research_question_id=? AND status='active' "
             "AND executed_at IS NULL ORDER BY priority DESC,id",
@@ -624,12 +732,26 @@ class Database:
         """Reconsider a saved lead without bypassing priority or the active cap."""
         with self.conn:
             row = self.conn.execute(
-                "SELECT priority FROM queries WHERE id=? AND research_question_id=? "
+                "SELECT priority,source_target_id,query FROM queries "
+                "WHERE id=? AND research_question_id=? "
                 "AND status='deferred' AND executed_at IS NULL",
                 (query_id, question_id),
             ).fetchone()
             if row is None:
                 raise ValueError("Query is not a deferred lead")
+            if self.conn.execute(
+                "SELECT 1 FROM source_targets WHERE research_question_id=?",
+                (question_id,),
+            ).fetchone():
+                if row["source_target_id"] is None or generic_query(row["query"]):
+                    return False
+                self.conn.execute("UPDATE queries SET status='active' WHERE id=?", (query_id,))
+                self._enforce_frontier_cap_tx(question_id)
+                return bool(
+                    self.conn.execute(
+                        "SELECT 1 FROM queries WHERE id=? AND status='active'", (query_id,)
+                    ).fetchone()
+                )
             active = self.conn.execute(
                 "SELECT priority FROM queries WHERE research_question_id=? AND status='active' "
                 "ORDER BY priority DESC,id LIMIT ?",
@@ -655,6 +777,20 @@ class Database:
             (question_id, key),
         ).fetchone():
             raise ValueError("Unknown research avenue")
+        if (
+            self.conn.execute(
+                "SELECT 1 FROM queries WHERE research_question_id=? AND avenue=? "
+                "AND source_target_id IS NOT NULL LIMIT 1",
+                (question_id, key),
+            ).fetchone()
+            and not self.conn.execute(
+                "SELECT 1 FROM evidence e JOIN queries q ON q.id=e.discovered_by_query_id "
+                "WHERE q.research_question_id=? AND q.avenue=? "
+                "AND e.primary_source_verified=1 LIMIT 1",
+                (question_id, key),
+            ).fetchone()
+        ):
+            raise ValueError("Unresolved source target cannot be retired after search failures")
         self.conn.execute(
             "INSERT OR IGNORE INTO exhausted_avenues VALUES (?,?,?,?)",
             (question_id, key, reason, utc_now()),
@@ -667,10 +803,15 @@ class Database:
 
     def mark_query_executed(self, query_id: int) -> None:
         with self.conn:
+            row = self.conn.execute(
+                "SELECT research_question_id FROM queries WHERE id=?", (query_id,)
+            ).fetchone()
             self.conn.execute(
                 "UPDATE queries SET executed_at=?,status='executed' WHERE id=?",
                 (utc_now(), query_id),
             )
+            if row:
+                self._enforce_frontier_cap_tx(row["research_question_id"])
 
     def review_due(self, question_id: int) -> int | None:
         row = self.conn.execute(
@@ -1168,6 +1309,14 @@ class Database:
                         (question_id, key),
                     ).fetchone()
                     rejection = "No reviewable avenue" if known else "Unknown avenue ID"
+                elif self.conn.execute(
+                    "SELECT 1 FROM queries q WHERE q.research_question_id=? "
+                    "AND q.avenue=? AND q.source_target_id IS NOT NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM evidence e "
+                    "WHERE e.discovered_by_query_id=q.id AND e.primary_source_verified=1) LIMIT 1",
+                    (question_id, key),
+                ).fetchone():
+                    rejection = "Unresolved source target needs primary evidence"
                 else:
                     self._retire_avenue_tx(question_id, key, reason)
                     continue
@@ -1188,7 +1337,12 @@ class Database:
                     "WHERE q.research_question_id=? AND q.avenue=? AND q.reviewed_at IS NOT NULL",
                     (question_id, key),
                 ).fetchone()
-                if yield_row["searches"] >= 3 and not yield_row["evidence_count"]:
+                targeted = self.conn.execute(
+                    "SELECT 1 FROM queries WHERE research_question_id=? AND avenue=? "
+                    "AND source_target_id IS NOT NULL LIMIT 1",
+                    (question_id, key),
+                ).fetchone()
+                if yield_row["searches"] >= 3 and not yield_row["evidence_count"] and not targeted:
                     self._retire_avenue_tx(
                         question_id, key, "Three reviewed searches yielded no evidence"
                     )

@@ -8,6 +8,7 @@ import pytest
 
 from hypertrace.db import SCHEMA, Database
 from hypertrace.models import AdversarialReview, ResearchQuestion, ResearchRun, SearchQuery
+from hypertrace.planner import TARGET_QUERIES, seed_source_targets
 
 
 def proposed(question_id: int, query: str, *, value: str = "high") -> SearchQuery:
@@ -184,3 +185,70 @@ def test_legacy_migration_preserves_query_provenance(tmp_path):
         assert all(row["created_at"] == "2026-01-01" for row in rows)
         assert {row["status"] for row in rows} == {"active", "deferred", "rejected_duplicate"}
         assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_source_targets_prioritize_primary_hunt_and_keep_query_provenance(tmp_path):
+    path = tmp_path / "targets.sqlite"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        generic = db.add_query(proposed(qid, "hyperpop history retrospective article"))
+        earlier = db.add_query(proposed(qid, TARGET_QUERIES[0][1]))
+        seed_source_targets(db, qid)
+        targeted_generic = proposed(qid, "hyperpop history")
+        targeted_generic.source_target = "pc-music-2014"
+        generic_target_id = db.add_query(targeted_generic)
+        seed_source_targets(db, qid)
+        active = db.rows(
+            "SELECT q.query,t.key FROM queries q JOIN source_targets t "
+            "ON t.id=q.source_target_id WHERE q.status='active' "
+            "ORDER BY q.priority DESC,q.id"
+        )
+        assert len(active) == 15
+        assert [row["key"] for row in active] == [
+            key
+            for key in (
+                "pc-music-2014",
+                "bjork-transmission",
+                "hyperballad-title",
+                "spotify-naming",
+                "scene-2014-2018",
+            )
+            for _ in range(3)
+        ]
+        assert db.rows("SELECT status FROM queries WHERE id=?", (generic,))[0][0] == "deferred"
+        assert db.rows("SELECT source_target_id FROM queries WHERE id=?", (earlier,))[0][0]
+        assert (
+            db.rows("SELECT COUNT(*) FROM queries WHERE query=?", (TARGET_QUERIES[0][1],))[0][0]
+            == 1
+        )
+        assert (
+            db.rows("SELECT status FROM queries WHERE id=?", (generic_target_id,))[0][0]
+            == "deferred"
+        )
+        assert db.rows("SELECT COUNT(*) FROM source_targets WHERE status='unresolved'")[0][0] == 5
+    with Database(path) as db:
+        assert db.rows("SELECT COUNT(*) FROM queries WHERE status='active'")[0][0] == 15
+        assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_source_variants_are_capped_and_failed_searches_do_not_close_target(tmp_path):
+    with Database(tmp_path / "targets.sqlite", active_query_limit=50) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        seed_source_targets(db, qid)
+        variant_query = proposed(qid, '"hyper-pop" "Philip Sherburne" 2014 review')
+        variant_query.source_target = "pc-music-2014"
+        variant = db.add_query(variant_query)
+        assert db.rows("SELECT status FROM queries WHERE id=?", (variant,))[0][0] == "deferred"
+        first = db.rows(
+            "SELECT q.id,q.avenue FROM queries q JOIN source_targets t "
+            "ON t.id=q.source_target_id WHERE t.key='pc-music-2014' "
+            "AND q.status='active' ORDER BY q.priority DESC,q.id LIMIT 1"
+        )[0]
+        with pytest.raises(ValueError, match="Unresolved source target"):
+            db.retire_avenue(qid, first["avenue"], "Search results did not expose the article")
+        db.mark_query_executed(first["id"])
+        assert db.rows("SELECT status FROM queries WHERE id=?", (variant,))[0][0] == "active"
+        assert (
+            db.rows("SELECT status FROM source_targets WHERE key='pc-music-2014'")[0][0]
+            == "unresolved"
+        )

@@ -119,6 +119,7 @@ class SearchQuery(BaseModel):
     information_value: str = "medium"
     novelty: str = ""
     admission_basis: str = "unresolved_gap"
+    source_target: str | None = None
 
 
 class Source(BaseModel):
@@ -203,6 +204,7 @@ class PlannedQuery(BaseModel):
     admission_basis: Literal[
         "unresolved_gap", "hypothesis_distinction", "primary_source", "new_avenue"
     ]
+    source_target: str | None = None
 
 
 class QueryPlan(BaseModel):

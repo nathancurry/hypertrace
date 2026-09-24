@@ -44,6 +44,52 @@ _STOP = {
     "with",
 }
 _VALUE = {"low": 1, "medium": 2, "high": 3}
+TARGET_RANK = {
+    "pc-music-2014": 5,
+    "bjork-transmission": 4,
+    "hyperballad-title": 3,
+    "spotify-naming": 2,
+    "scene-2014-2018": 1,
+}
+TARGET_ACTIVE_LIMIT = 3
+
+
+def generic_query(query: str) -> bool:
+    """Broad retrospectives do not displace searches for a named source."""
+    text = query.lower()
+    broad = any(
+        phrase in text
+        for phrase in (
+            "hyperpop history",
+            "history of hyperpop",
+            "origin of hyperpop",
+            "what is hyperpop",
+        )
+    )
+    anchored = any(
+        word in text
+        for word in (
+            "sherburne",
+            "mcdonald",
+            "szabo",
+            "hyperballad",
+            "pc music",
+            "485-pc-musics-twisted-electronic-pop-a-users-manual",
+        )
+    )
+    return broad and not anchored
+
+
+def target_priority(target: str, query: str, value: str) -> int:
+    score = TARGET_RANK[target] * 100 + _VALUE[value] * 10
+    score += min(query.count('"'), 4)
+    if "site:" in query:
+        score += 3
+    if "web.archive.org" in query or "archive.org" in query:
+        score += 2
+    if generic_query(query):
+        score -= 50
+    return score
 
 
 def _words(query: str) -> set[str]:

@@ -406,9 +406,19 @@ class Researcher:
         pending = [
             dict(row)
             for row in self.db.rows(
-                "SELECT id,query,rationale,gap,information_value,avenue FROM queries "
-                "WHERE research_question_id=? AND status='active' AND executed_at IS NULL "
-                "ORDER BY priority DESC,id LIMIT 10",
+                "SELECT q.id,q.query,q.rationale,q.gap,q.information_value,q.avenue,"
+                "t.key AS source_target FROM queries q LEFT JOIN source_targets t "
+                "ON t.id=q.source_target_id WHERE q.research_question_id=? "
+                "AND q.status='active' AND q.executed_at IS NULL "
+                "ORDER BY q.priority DESC,q.id LIMIT 10",
+                (self.question_id,),
+            )
+        ]
+        source_targets = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT key,description,status FROM source_targets "
+                "WHERE research_question_id=? ORDER BY id",
                 (self.question_id,),
             )
         ]
@@ -446,6 +456,7 @@ class Researcher:
             "evidence": evidence,
             "relationships": relationships,
             "pending_queries": pending,
+            "source_targets": source_targets,
             "leads": leads,
             "failed_sources": failed_sources,
             "avenues": avenues,
@@ -471,6 +482,7 @@ class Researcher:
                     information_value=item.information_value,
                     novelty=item.novelty,
                     admission_basis=item.admission_basis,
+                    source_target=item.source_target,
                     generated_by=self.config.router_model,
                 )
                 for item in plan.queries
@@ -596,6 +608,7 @@ class Researcher:
                     {
                         "question": context["question"],
                         "hypotheses": context["hypotheses"],
+                        "source_targets": context["source_targets"],
                         "source": {**source_metadata, **source_text},
                     },
                     ensure_ascii=False,
@@ -681,6 +694,7 @@ class Researcher:
                 information_value=lead.information_value,
                 novelty=lead.novelty,
                 admission_basis=lead.admission_basis,
+                source_target=lead.source_target,
                 generated_by=self.model,
             )
             for lead in assessment.new_queries
@@ -806,6 +820,7 @@ class Researcher:
                     information_value=lead.information_value,
                     novelty=lead.novelty,
                     admission_basis=lead.admission_basis,
+                    source_target=lead.source_target,
                     generated_by=self.config.review_model,
                 )
                 for lead in review.next_queries

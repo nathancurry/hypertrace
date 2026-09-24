@@ -10,7 +10,7 @@ from hypertrace.config import Config
 from hypertrace.db import Database
 from hypertrace.llm.openai_compatible import OpenAICompatibleLLM
 from hypertrace.models import Hypothesis, ResearchQuestion
-from hypertrace.planner import seed_motivating_case
+from hypertrace.planner import seed_motivating_case, seed_source_targets
 from hypertrace.reports import markdown_report
 from hypertrace.research import Limits, Researcher
 from hypertrace.retrieval.web import BraveWeb
@@ -21,6 +21,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, help="SQLite database path (default HYPERTRACE_DB)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Create database and seed motivating case")
+    target = sub.add_parser("target-sources", help="Install unresolved primary-source targets")
+    target.add_argument("--question-id", type=int)
     create = sub.add_parser("research", help="Add a new research question")
     create.add_argument("question")
     create.add_argument("--hypothesis", action="append", default=[])
@@ -91,6 +93,10 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Created question {qid}")
             return
         qid = _question_id(db, args.question_id)
+        if args.command == "target-sources":
+            seed_source_targets(db, qid)
+            print(f"Installed unresolved source targets for question {qid}")
+            return
         if args.command == "activate-query":
             activated = db.activate_deferred_query(qid, args.query_id)
             print(
