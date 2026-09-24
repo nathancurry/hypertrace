@@ -29,7 +29,7 @@ from hypertrace.models import (
     Source,
 )
 from hypertrace.planner import ASSESS_SYSTEM, INTERPRET_SYSTEM, PLAN_SYSTEM, REVIEW_SYSTEM
-from hypertrace.retrieval.base import Retrieval
+from hypertrace.retrieval.base import FetchFailure, Retrieval
 
 
 class BudgetStop(Exception):
@@ -231,6 +231,30 @@ class Researcher:
             if self.config.llm_api_key:
                 message = message.replace(self.config.llm_api_key, "[redacted]")
             return f"{type(exc).__name__}: {message[:300]}"
+        return type(exc).__name__
+
+    @staticmethod
+    def _safe_fetch_error(exc: Exception) -> str:
+        if isinstance(exc, FetchFailure) and exc.status_code is not None:
+            return f"HTTP {exc.status_code}"
+        if isinstance(exc, httpx.HTTPStatusError):
+            return f"HTTP {exc.response.status_code}"
+        if isinstance(exc, (FetchFailure, ValueError)):
+            message = str(exc)
+            if isinstance(exc, FetchFailure) and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9]{1,40}", message
+            ):
+                return message
+            if message.startswith("Unsupported content type:"):
+                match = re.match(r"Unsupported content type: ([\w.+/-]+)", message)
+                return match.group(0)[:200] if match else "Unsupported content type"
+            if message in {
+                "Redirect without location",
+                "Too many redirects",
+                "Page exceeds 2 MB retrieval limit",
+                "Fetched page contains no readable text",
+            }:
+                return message
         return type(exc).__name__
 
     def _record(
@@ -444,33 +468,38 @@ class Researcher:
                     timeout=max(0.001, self.deadline - time.monotonic()),
                 )
             except TimeoutError as exc:
-                self._record("fetch", f"url={candidate['url']} timed out")
-                self.db.record_fetch_failure(candidate["id"], "Fetch timed out", retryable=True)
-                raise BudgetStop("max_minutes") from exc
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in (429, 500, 502, 503, 504):
-                    self._record("fetch", f"url={candidate['url']} retry later: {exc}")
-                    self.db.record_fetch_failure(candidate["id"], str(exc), retryable=True)
-                    raise
-                self._record("fetch", f"url={candidate['url']} skipped: {exc}")
-                self.db.record_fetch_failure(candidate["id"], str(exc), retryable=False)
-                return False
-            except httpx.TransportError as exc:
-                self._record("fetch", f"url={candidate['url']} retry later: {exc}")
-                self.db.record_fetch_failure(candidate["id"], str(exc), retryable=True)
-                raise
-            except (ValueError, OSError) as exc:
-                self._record(
-                    "fetch", f"url={candidate['url']} skipped: {type(exc).__name__}: {exc}"
-                )
-                self.db.record_fetch_failure(candidate["id"], str(exc), retryable=False)
-                return False
-            except Exception as exc:
-                self._record("fetch", f"url={candidate['url']} failed: {type(exc).__name__}: {exc}")
+                self._record("fetch", f"candidate_id={candidate['id']} timed out")
                 self.db.record_fetch_failure(
-                    candidate["id"], f"{type(exc).__name__}: {exc}", retryable=True
+                    candidate["id"], "Fetch timed out", retryable=True, final_url=candidate["url"]
                 )
-                raise
+                raise BudgetStop("max_minutes") from exc
+            except (FetchFailure, httpx.HTTPError, ValueError, OSError) as exc:
+                if isinstance(exc, FetchFailure):
+                    status = exc.status_code
+                    final_url = exc.final_url
+                    redirects = exc.redirect_chain
+                    retryable = exc.retryable
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    final_url = str(exc.response.url)
+                    redirects = None
+                    retryable = status == 429 or 500 <= status < 600
+                else:
+                    status = None
+                    final_url = candidate["url"]
+                    redirects = None
+                    retryable = isinstance(exc, httpx.TransportError)
+                reason = self._safe_fetch_error(exc)
+                self._record("fetch", f"candidate_id={candidate['id']} failed: {reason}")
+                self.db.record_fetch_failure(
+                    candidate["id"],
+                    reason,
+                    retryable=retryable,
+                    status_code=status,
+                    final_url=final_url,
+                    redirect_chain=redirects,
+                )
+                return False
             source_id = self.db.attach_source(candidate["id"], source)
             self.fetched += 1
             self._record("fetch", f"source_id={source_id} url={source.retrieved_url}")
@@ -489,6 +518,7 @@ class Researcher:
                 candidate["id"],
                 "No attributable article-body text was extracted",
                 retryable=False,
+                final_url=source.retrieved_url,
             )
             return False
         context = self._context()
@@ -709,6 +739,7 @@ class Researcher:
             )
         )
         try:
+            self.db.requeue_retryable_fetches(self.question_id)
             while True:
                 self._check()
                 candidate = self.db.pending_candidate(self.question_id)

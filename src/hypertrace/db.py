@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS candidates (
   id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES queries(id),
   url TEXT NOT NULL, title TEXT NOT NULL, source_id INTEGER REFERENCES sources(id),
   assessed_at TEXT, fetch_error TEXT, failure_at TEXT, assessment_error TEXT,
+  fetch_status INTEGER, fetch_final_url TEXT, fetch_redirects_json TEXT,
+  fetch_retryable INTEGER CHECK(fetch_retryable IN (0,1)),
   assessment_mode TEXT CHECK(assessment_mode IN ('full_document','relevance_windows')),
   UNIQUE(query_id, url)
 );
@@ -183,6 +185,10 @@ class Database:
                 "failure_at": "TEXT",
                 "assessment_error": "TEXT",
                 "assessment_mode": "TEXT",
+                "fetch_status": "INTEGER",
+                "fetch_final_url": "TEXT",
+                "fetch_redirects_json": "TEXT",
+                "fetch_retryable": "INTEGER",
             },
             "evidence": {
                 "quote_region": "TEXT NOT NULL DEFAULT 'unknown'",
@@ -217,6 +223,27 @@ class Database:
                 "WHERE source_id IS NOT NULL AND assessed_at IS NULL "
                 "AND fetch_error='Fetched text exceeds the 16,000-character assessment window'"
             )
+            for row in self.conn.execute(
+                "SELECT id,fetch_error,failure_at FROM candidates "
+                "WHERE fetch_error IS NOT NULL AND fetch_retryable IS NULL"
+            ).fetchall():
+                match = re.search(r"\b([45]\d\d) [^']*' for url '([^']+)'", row["fetch_error"])
+                status = int(match.group(1)) if match else None
+                final_url = match.group(2) if match else None
+                retryable = row["failure_at"] is None
+                reason = f"HTTP {status}" if status is not None else row["fetch_error"][:200]
+                self.conn.execute(
+                    "UPDATE candidates SET fetch_error=?,failure_at=?,fetch_status=?,"
+                    "fetch_final_url=?,fetch_retryable=? WHERE id=?",
+                    (
+                        reason,
+                        row["failure_at"] or utc_now(),
+                        status,
+                        final_url,
+                        int(retryable),
+                        row["id"],
+                    ),
+                )
             if legacy_evidence:
                 self.conn.execute(
                     "UPDATE hypotheses SET status='open',"
@@ -364,16 +391,44 @@ class Database:
             raise ValueError("Fetch failures must remain unresolved")
         with self.conn:
             self.conn.execute(
-                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL "
+                "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL,"
+                "fetch_status=NULL,fetch_final_url=NULL,fetch_redirects_json=NULL,"
+                "fetch_retryable=NULL "
                 "WHERE id=?",
                 (utc_now(), candidate_id),
             )
 
-    def record_fetch_failure(self, candidate_id: int, reason: str, *, retryable: bool) -> None:
+    def record_fetch_failure(
+        self,
+        candidate_id: int,
+        reason: str,
+        *,
+        retryable: bool,
+        status_code: int | None = None,
+        final_url: str | None = None,
+        redirect_chain: list[str] | None = None,
+    ) -> None:
         with self.conn:
             self.conn.execute(
-                "UPDATE candidates SET fetch_error=?,failure_at=? WHERE id=?",
-                (reason, None if retryable else utc_now(), candidate_id),
+                "UPDATE candidates SET fetch_error=?,failure_at=?,fetch_status=?,"
+                "fetch_final_url=?,fetch_redirects_json=?,fetch_retryable=? WHERE id=?",
+                (
+                    reason[:200],
+                    utc_now(),
+                    status_code,
+                    final_url,
+                    json.dumps(redirect_chain) if redirect_chain is not None else None,
+                    int(retryable),
+                    candidate_id,
+                ),
+            )
+
+    def requeue_retryable_fetches(self, question_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE candidates SET failure_at=NULL WHERE fetch_retryable=1 "
+                "AND query_id IN (SELECT id FROM queries WHERE research_question_id=?)",
+                (question_id,),
             )
 
     def record_assessment_failure(self, candidate_id: int, error: str) -> None:
@@ -415,7 +470,10 @@ class Database:
                 raise ValueError("Candidate is unavailable for source attachment")
             source_id = self._add_source_tx(source)
             self.conn.execute(
-                "UPDATE candidates SET source_id=? WHERE id=?", (source_id, candidate_id)
+                "UPDATE candidates SET source_id=?,fetch_error=NULL,fetch_status=NULL,"
+                "fetch_final_url=NULL,fetch_redirects_json=NULL,fetch_retryable=NULL "
+                "WHERE id=?",
+                (source_id, candidate_id),
             )
         return source_id
 

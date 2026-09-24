@@ -31,7 +31,7 @@ from hypertrace.models import (
 )
 from hypertrace.reports import markdown_report
 from hypertrace.research import Limits, Researcher
-from hypertrace.retrieval.base import SearchResult
+from hypertrace.retrieval.base import FetchFailure, SearchResult
 from hypertrace.retrieval.web import BraveWeb, canonicalize_url
 
 
@@ -243,6 +243,150 @@ def test_web_fetch_preserves_metadata_caveat_and_canonical_url():
         assert page.document_hash == hashlib.sha256(html.encode()).hexdigest()
 
     asyncio.run(exercise())
+
+
+def test_brave_result_redirect_429_is_recorded_and_run_continues(tmp_path):
+    original = "https://news.google.com/search?for=playstation+controller+ps5"
+    final = "https://www.google.com/sorry/index?continue=playstation&token=private"
+    next_url = "https://example.org/article"
+    query = '"hyperpop" site:news.google.com 1990..2013'
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.host == "api.search.brave.com":
+            assert request.url.params["q"] == query
+            return httpx.Response(
+                200,
+                json={
+                    "web": {
+                        "results": [
+                            {"url": original, "title": "Google News - Search"},
+                            {"url": next_url, "title": "Relevant article"},
+                        ]
+                    }
+                },
+            )
+        if str(request.url) == original:
+            return httpx.Response(302, headers={"location": final})
+        if str(request.url) == final:
+            return httpx.Response(429)
+        if str(request.url) == next_url:
+            return httpx.Response(
+                200,
+                text="<html><article><p>A 2001 page uses the word hyperpop.</p></article></html>",
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    async def exercise():
+        config = _config(tmp_path)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with Database(config.db_path) as db:
+                question_id = db.add_question(
+                    ResearchQuestion(question="Where did hyperpop originate?")
+                )
+                query_id = db.add_query(
+                    SearchQuery(
+                        research_question_id=question_id,
+                        query=query,
+                        generated_by="cheap",
+                    )
+                )
+                run_id = await Researcher(
+                    db,
+                    FakeLLM(),
+                    BraveWeb("key", client),
+                    config,
+                    question_id,
+                    Limits(max_actions=10),
+                ).run()
+                candidates = db.rows(
+                    "SELECT * FROM candidates WHERE query_id=? ORDER BY id", (query_id,)
+                )
+                failed, succeeded = candidates
+                assert (failed["url"], failed["title"]) == (original, "Google News - Search")
+                assert failed["source_id"] is None
+                assert failed["assessed_at"] is None
+                assert failed["failure_at"] is not None
+                assert failed["fetch_status"] == 429
+                assert failed["fetch_retryable"] == 1
+                assert failed["fetch_final_url"] == final
+                assert json.loads(failed["fetch_redirects_json"]) == [original, final]
+                assert failed["fetch_error"] == "HTTP 429"
+                assert "private" not in failed["fetch_error"]
+                assert succeeded["source_id"] is not None
+                assert succeeded["assessed_at"] is not None
+                assert db.rows("SELECT status FROM runs WHERE id=?", (run_id,))[0][0] == "stopped"
+                report = markdown_report(db, question_id)
+                assert original in report and final in report
+                assert "retryable: HTTP 429" in report
+                resumed = await Researcher(
+                    db,
+                    FakeLLM(),
+                    BraveWeb("key", client),
+                    config,
+                    question_id,
+                    Limits(max_actions=10),
+                ).run()
+                assert db.rows("SELECT status FROM runs WHERE id=?", (resumed,))[0][0] == "stopped"
+        assert requested.index(original) < requested.index(final) < requested.index(next_url)
+        assert requested.count(original) == requested.count(final) == 2
+        assert requested.count(next_url) == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "retryable"),
+    [
+        (403, 403, False),
+        (404, 404, False),
+        (429, 429, True),
+        (503, 503, True),
+        (httpx.ReadTimeout, None, True),
+        (httpx.ConnectError, None, True),
+    ],
+)
+def test_fetch_classifies_http_and_transport_failures(failure, status, retryable):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        raise failure("network failure with possible secret", request=request)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(FetchFailure) as caught:
+                await BraveWeb("key", client).fetch("https://example.org/article")
+        assert caught.value.status_code == status
+        assert caught.value.retryable is retryable
+        assert caught.value.original_url == "https://example.org/article"
+        assert caught.value.final_url == "https://example.org/article"
+
+    asyncio.run(exercise())
+
+
+def test_legacy_retryable_fetch_gap_migrates_without_losing_final_url(tmp_path):
+    path = tmp_path / "research.db"
+    original = "https://news.google.com/search?for=playstation"
+    final = "https://www.google.com/sorry/index?continue=playstation"
+    with Database(path) as db:
+        question_id = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        query_id = db.add_query(SearchQuery(research_question_id=question_id, query="hyperpop"))
+        db.add_candidate(query_id, original, "Google News - Search")
+        db.conn.execute(
+            "UPDATE candidates SET fetch_error=? WHERE query_id=?",
+            (f"Client error '429 Too Many Requests' for url '{final}'", query_id),
+        )
+        db.conn.commit()
+    with Database(path) as db:
+        candidate = db.rows("SELECT * FROM candidates WHERE query_id=?", (query_id,))[0]
+        assert candidate["fetch_error"] == "HTTP 429"
+        assert candidate["fetch_status"] == 429
+        assert candidate["fetch_final_url"] == final
+        assert candidate["fetch_retryable"] == 1
+        assert candidate["failure_at"] is not None
+        assert db.pending_candidate(question_id) is None
 
 
 class FakeRetrieval:

@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import httpx
 
 from hypertrace.models import ContentRegion, QuoteRegion, Source
-from hypertrace.retrieval.base import SearchResult
+from hypertrace.retrieval.base import FetchFailure, SearchResult
 
 TRACKING = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
@@ -283,7 +283,28 @@ class BraveWeb:
         ]
 
     async def fetch(self, url: str) -> Source:
-        current = canonicalize_url(url)
+        redirects = [canonicalize_url(url)]
+        try:
+            return await self._fetch(redirects)
+        except (httpx.HTTPStatusError, httpx.TransportError, ValueError) as exc:
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            if status is not None:
+                reason = f"HTTP {status}"
+            elif isinstance(exc, httpx.TransportError):
+                reason = type(exc).__name__
+            else:
+                reason = str(exc)
+            raise FetchFailure(
+                reason,
+                url,
+                redirects,
+                status_code=status,
+                retryable=(status == 429 or status is not None and 500 <= status < 600)
+                or isinstance(exc, httpx.TransportError),
+            ) from exc
+
+    async def _fetch(self, redirects: list[str]) -> Source:
+        current = redirects[-1]
         for _ in range(4):
             async with self.client.stream(
                 "GET", current, headers={"User-Agent": "hypertrace/0.1"}
@@ -293,6 +314,7 @@ class BraveWeb:
                     if not location:
                         raise ValueError("Redirect without location")
                     current = canonicalize_url(urljoin(current, location))
+                    redirects.append(current)
                     continue
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()

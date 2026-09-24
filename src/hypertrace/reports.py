@@ -104,7 +104,8 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     failures = db.rows(
-        "SELECT c.url,c.fetch_error,c.failure_at,q.query FROM candidates c "
+        "SELECT c.url,c.fetch_error,c.fetch_retryable,c.fetch_status,c.fetch_final_url,"
+        "c.fetch_redirects_json,q.query FROM candidates c "
         "JOIN queries q ON q.id=c.query_id "
         "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL ORDER BY c.id",
         (question_id,),
@@ -336,10 +337,16 @@ def markdown_report(db: Database, question_id: int) -> str:
     lines.extend(["", "## Inaccessible or failed sources", ""])
     if failures:
         for failure in failures:
-            state = "retryable" if failure["failure_at"] is None else "unresolved"
+            state = "retryable" if failure["fetch_retryable"] else "unresolved"
+            destination = (
+                f"; final URL {_cell(failure['fetch_final_url'])}"
+                if failure["fetch_final_url"] and failure["fetch_final_url"] != failure["url"]
+                else ""
+            )
             lines.append(
                 f"- [{_cell(failure['url'])}]({failure['url']}) — {state}: "
-                f"{_cell(failure['fetch_error'])}; discovered by `{_cell(failure['query'])}`"
+                f"{_cell(failure['fetch_error'])}{destination}; "
+                f"discovered by `{_cell(failure['query'])}`"
             )
     else:
         lines.append(
