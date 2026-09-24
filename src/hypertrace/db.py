@@ -116,6 +116,16 @@ CREATE TABLE IF NOT EXISTS candidates (
   assessment_mode TEXT CHECK(assessment_mode IN ('full_document','relevance_windows')),
   UNIQUE(query_id, url)
 );
+CREATE TABLE IF NOT EXISTS query_target_proposals (
+  id INTEGER PRIMARY KEY,
+  query_id INTEGER NOT NULL REFERENCES queries(id),
+  candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+  source_target_key TEXT NOT NULL,
+  target_purpose TEXT NOT NULL CHECK(target_purpose IN ('source','dating')),
+  disposition TEXT NOT NULL CHECK(disposition IN ('associated','rejected_duplicate')),
+  reason TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(candidate_id,query_id,source_target_key,target_purpose)
+);
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
@@ -1476,7 +1486,10 @@ class Database:
         if mode not in {"full_document", "relevance_windows"}:
             raise ValueError("Unknown assessment mode")
         candidate = self.conn.execute(
-            "SELECT source_id,assessed_at,failure_at FROM candidates WHERE id=?", (candidate_id,)
+            "SELECT c.source_id,c.assessed_at,c.failure_at,q.research_question_id,"
+            "q.source_target_id AS origin_target_id FROM candidates c "
+            "JOIN queries q ON q.id=c.query_id WHERE c.id=?",
+            (candidate_id,),
         ).fetchone()
         if (
             candidate is None
@@ -1497,7 +1510,10 @@ class Database:
                     raise ValueError("Lead source does not match candidate")
                 self._add_lead_tx(lead)
             for query in queries:
-                self._add_query_tx(query, proposed=True)
+                if query.research_question_id != candidate["research_question_id"]:
+                    raise ValueError("Query belongs to another research question")
+                if not self._record_candidate_query_collision_tx(candidate_id, candidate, query):
+                    self._add_query_tx(query, proposed=True)
             self.conn.execute(
                 "UPDATE candidates SET assessed_at=?,fetch_error=NULL,assessment_error=NULL,"
                 "assessment_mode=? "
@@ -1505,6 +1521,71 @@ class Database:
                 (utc_now(), mode, candidate_id),
             )
         return len(evidence)
+
+    def _record_candidate_query_collision_tx(
+        self, candidate_id: int, candidate: sqlite3.Row, query: SearchQuery
+    ) -> bool:
+        existing = self.conn.execute(
+            "SELECT id,source_target_id,target_purpose FROM queries "
+            "WHERE research_question_id=? AND query=?",
+            (query.research_question_id, query.query),
+        ).fetchone()
+        if existing is None or query.source_target is None:
+            return False
+        target = self.conn.execute(
+            "SELECT id,status,dating_status FROM source_targets "
+            "WHERE research_question_id=? AND key=?",
+            (query.research_question_id, query.source_target),
+        ).fetchone()
+        target_id = target["id"] if target else None
+        eligible = target is not None and (
+            (query.target_purpose == "source" and target["status"] == "unresolved")
+            or (
+                query.target_purpose == "dating"
+                and target["status"] == "resolved"
+                and target["dating_status"] == "unresolved"
+            )
+        )
+        if (
+            eligible
+            and target_id == existing["source_target_id"]
+            and query.target_purpose == existing["target_purpose"]
+        ):
+            return False
+        if not eligible:
+            disposition, reason = (
+                "rejected_duplicate",
+                "Proposed target is unavailable for this purpose",
+            )
+        # A distinct target is associated only when it produced this candidate.
+        elif (
+            target_id == existing["source_target_id"] or target_id == candidate["origin_target_id"]
+        ):
+            disposition, reason = (
+                "associated",
+                "Proposal serves the candidate's target or a new purpose for the same target",
+            )
+        else:
+            disposition, reason = (
+                "rejected_duplicate",
+                "Proposal is outside the candidate's source target",
+            )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO query_target_proposals "
+            "(query_id,candidate_id,source_target_key,target_purpose,disposition,reason,rationale,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                existing["id"],
+                candidate_id,
+                query.source_target,
+                query.target_purpose,
+                disposition,
+                reason,
+                query.rationale,
+                utc_now(),
+            ),
+        )
+        return True
 
     def persist_review(
         self,
