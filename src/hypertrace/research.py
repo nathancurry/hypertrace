@@ -1137,7 +1137,7 @@ class Researcher:
                 {"id": hypothesis_id, "statement": statement, "status": "open"}
             )
 
-    async def _review(self, query_id: int) -> None:
+    async def _review(self, query_id: int, *, allow_repeat: bool = False) -> None:
         try:
             context, counts = self._review_context(query_id)
             prompt = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
@@ -1190,9 +1190,60 @@ class Researcher:
                     generated_by=self.config.review_model,
                 )
                 for lead in review.next_queries
-            ],
+                if lead.information_value == "high"
+            ][: self.config.review_query_limit],
             [(item.avenue_id, item.reason) for item in review.exhausted_avenues],
+            allow_repeat=allow_repeat,
         )
+
+    async def _maybe_review(self, *, final: bool = False) -> bool:
+        state = self.db.review_cadence_state(self.question_id)
+        query_id = self.db.review_due(self.question_id)
+        material = bool(state["evidence_ids"] or state["target_keys"] or state["hypothesis_ids"])
+        if query_id is None and (
+            material or state["meaningful_actions"] >= self.config.review_action_threshold
+        ):
+            query_id = self.db.review_due(self.question_id, allow_reviewed=True)
+        if query_id is None:
+            return False
+        if final:
+            if not material:
+                reason = "no_material_change"
+            elif (
+                self.actions >= self.limits.max_actions
+                or time.monotonic() + 120 >= self.deadline
+                or (self.limits.max_cost is not None and self.cost >= self.limits.max_cost)
+            ):
+                reason = "insufficient_budget"
+            else:
+                reason = "final_material_evidence"
+        elif state["target_keys"]:
+            reason = "source_target_changed"
+        elif state["evidence_ids"]:
+            reason = "important_evidence"
+        elif state["hypothesis_ids"] and state["last_review_at"] is not None:
+            reason = "hypothesis_changed"
+        elif state["meaningful_actions"] >= self.config.review_action_threshold:
+            reason = "action_threshold"
+        else:
+            reason = "below_action_threshold"
+        if (
+            reason not in {"no_material_change", "insufficient_budget", "below_action_threshold"}
+            and state["last_review_at"] is not None
+            and time.monotonic() + 120 >= self.deadline
+        ):
+            reason = "insufficient_budget"
+        if reason in {"no_material_change", "insufficient_budget", "below_action_threshold"}:
+            self.db.record_review_cadence(self.run_id, self.question_id, "skipped", reason, state)
+            return False
+        self.db.record_review_cadence(self.run_id, self.question_id, "triggered", reason, state)
+        await self._review(
+            query_id,
+            allow_repeat=bool(
+                self.db.rows("SELECT reviewed_at FROM queries WHERE id=?", (query_id,))[0][0]
+            ),
+        )
+        return True
 
     async def run(self) -> int:
         self.deadline = time.monotonic() + self.limits.max_minutes * 60
@@ -1217,9 +1268,7 @@ class Researcher:
                     if self.evidence_added > before:
                         await self._interpret()
                     continue
-                review_query_id = self.db.review_due(self.question_id)
-                if review_query_id is not None:
-                    await self._review(review_query_id)
+                if await self._maybe_review():
                     continue
                 archive_target = (
                     self.db.next_archive_lookup(self.question_id) if self.archive else None
@@ -1242,6 +1291,11 @@ class Researcher:
                 query = context["pending_queries"][0]
                 await self._search(query)
         except BudgetStop as exc:
+            if str(exc) not in {"review_failed", "candidate_assessment_failed"}:
+                try:
+                    await self._maybe_review(final=True)
+                except BudgetStop:
+                    pass
             self.db.finish_run(self.run_id, "stopped", str(exc))
         except KeyboardInterrupt:
             self.db.finish_run(self.run_id, "stopped", "user_interrupt")

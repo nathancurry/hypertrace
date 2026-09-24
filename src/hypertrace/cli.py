@@ -190,6 +190,24 @@ def main(argv: list[str] | None = None) -> None:
                 f"{counts['exhausted']} exhausted queries; "
                 f"{counts['duplicates']} rejected duplicates; {counts['c']} pending pages"
             )
+            cadence = db.review_cadence_state(qid)
+            decision = db.rows(
+                "SELECT decision,reason FROM review_cadence_events "
+                "WHERE research_question_id=? ORDER BY id DESC LIMIT 1",
+                (qid,),
+            )
+            last_decision = (
+                f"; last decision {decision[0]['decision']} ({decision[0]['reason']})"
+                if decision
+                else ""
+            )
+            print(
+                f"Review cadence: {cadence['meaningful_actions']}/"
+                f"{config.review_action_threshold} meaningful actions since last review; "
+                f"important evidence {cadence['evidence_ids']}; "
+                f"target changes {cadence['target_keys']}; "
+                f"hypothesis changes {cadence['hypothesis_ids']}{last_decision}"
+            )
             runs = db.rows(
                 "SELECT * FROM runs WHERE research_question_id=? ORDER BY id DESC LIMIT 1", (qid,)
             )

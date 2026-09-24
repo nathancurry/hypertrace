@@ -230,10 +230,13 @@ substantively different explanations. When uncertain, reject. Return structured 
 
 REVIEW_SYSTEM = """Adversarially review the persisted historical record. Find overclaims,
 weak dating, retroactive tagging, repeated secondary claims, missing transmission evidence,
-falsification paths, and high-value next searches. Never assume earliest observed means origin.
+falsification paths, and high-value next searches. Prioritize challenging conclusions,
+identifying gaps, retiring genuinely exhausted avenues, and reprioritizing existing work.
+Never assume earliest observed means origin.
 Spend minimal reasoning and return the object promptly. Return concise JSON only, with no prose
-outside the schema. Use at most 3 short items in each concern or test list, and at most 5
-next_queries. Each query needs gap, information_value (high/medium/low), novelty
+outside the schema. Use at most 3 short items in each concern or test list, and at most 3
+next_queries, only when they have high information value. Each query needs gap,
+information_value (high), novelty
 relative to prior searches, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Prefer original sources behind attributed claims.
 When source_targets are supplied, use unresolved source targets for source searches.

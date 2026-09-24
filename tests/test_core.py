@@ -578,6 +578,7 @@ def _config(tmp_path) -> Config:
         output_cost_per_million=1,
         min_yield=0,
         json_mode=True,
+        review_action_threshold=1,
     )
 
 

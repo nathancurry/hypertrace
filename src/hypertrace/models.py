@@ -279,5 +279,5 @@ class AdversarialReview(BaseModel):
     source_dependence: list[str] = Field(default_factory=list, max_length=3)
     transmission_gaps: list[str] = Field(default_factory=list, max_length=3)
     falsification_tests: list[str] = Field(default_factory=list, max_length=3)
-    next_queries: list[PlannedQuery] = Field(default_factory=list, max_length=5)
+    next_queries: list[PlannedQuery] = Field(default_factory=list, max_length=3)
     exhausted_avenues: list[AvenueRetirement] = Field(default_factory=list, max_length=5)

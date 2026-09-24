@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from hypertrace.config import Config
 from hypertrace.db import Database
 
 
@@ -183,6 +184,36 @@ def markdown_report(db: Database, question_id: int) -> str:
             f"provider-reported cost ${run['provider_reported_cost']:.4f}, "
             f"locally estimated cost ${run['locally_estimated_cost']:.4f}, "
             f"{run['unknown_spend_requests']} requests with provider billing unknown."
+        )
+    cadence = db.review_cadence_state(question_id)
+    decision = db.rows(
+        "SELECT decision,reason,meaningful_actions,evidence_ids_json,target_keys_json,"
+        "hypothesis_ids_json "
+        "FROM review_cadence_events WHERE research_question_id=? ORDER BY id DESC LIMIT 1",
+        (question_id,),
+    )
+    lines.extend(
+        [
+            "",
+            "## Review cadence",
+            "",
+            (
+                f"{cadence['meaningful_actions']}/{Config.from_env().review_action_threshold} "
+                "meaningful actions since the last successful review. "
+                f"Important evidence: {cadence['evidence_ids']}; "
+                f"source-target changes: {cadence['target_keys']}; "
+                f"hypothesis changes: {cadence['hypothesis_ids']}."
+            ),
+        ]
+    )
+    if decision:
+        item = decision[0]
+        lines.append(
+            f"Last decision: {item['decision']} ({item['reason']}); "
+            f"{item['meaningful_actions']} meaningful actions; "
+            f"evidence {json.loads(item['evidence_ids_json'])}; "
+            f"targets {json.loads(item['target_keys_json'])}; "
+            f"hypotheses {json.loads(item['hypothesis_ids_json'])}."
         )
     lines.extend(["", "## Competing hypotheses (interpretations)", ""])
     if hypotheses:

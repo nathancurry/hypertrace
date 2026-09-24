@@ -42,6 +42,7 @@ def _config(tmp_path) -> Config:
         review_fallback_model="z-ai/glm-5.3",
         review_fallback_input_cost_per_million=7,
         review_fallback_output_cost_per_million=11,
+        review_action_threshold=1,
     )
 
 

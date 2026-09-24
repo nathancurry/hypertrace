@@ -31,6 +31,8 @@ class Config:
     review_fallback_model: str | None = None
     review_fallback_input_cost_per_million: float | None = None
     review_fallback_output_cost_per_million: float | None = None
+    review_action_threshold: int = 25
+    review_query_limit: int = 3
 
     @classmethod
     def from_env(cls) -> Config:
@@ -73,9 +75,15 @@ class Config:
                 if (value := os.getenv("REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION"))
                 else None
             ),
+            review_action_threshold=int(os.getenv("HYPERTRACE_REVIEW_ACTION_THRESHOLD", "25")),
+            review_query_limit=int(os.getenv("HYPERTRACE_REVIEW_QUERY_LIMIT", "3")),
         )
 
     def require_online(self, max_cost: float | None = None) -> None:
+        if self.review_action_threshold < 1:
+            raise ValueError("HYPERTRACE_REVIEW_ACTION_THRESHOLD must be positive")
+        if not 0 <= self.review_query_limit <= 3:
+            raise ValueError("HYPERTRACE_REVIEW_QUERY_LIMIT must be between 0 and 3")
         if not math.isfinite(self.local_usage_multiplier) or self.local_usage_multiplier < 1:
             raise ValueError("HYPERTRACE_LOCAL_USAGE_MULTIPLIER must be at least 1")
         if not self.llm_api_key:

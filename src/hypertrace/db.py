@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS source_targets (
   status TEXT NOT NULL DEFAULT 'unresolved' CHECK(status IN ('unresolved','resolved')),
   evidence_status TEXT NOT NULL DEFAULT 'unresolved',
   dating_status TEXT NOT NULL DEFAULT 'unresolved',
+  state_changed_at TEXT,
   UNIQUE(research_question_id,key)
 );
 CREATE TABLE IF NOT EXISTS archive_targets (
@@ -159,7 +160,7 @@ CREATE TABLE IF NOT EXISTS leads (
 CREATE TABLE IF NOT EXISTS relationships (
   id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL REFERENCES evidence(id),
   hypothesis_id INTEGER NOT NULL REFERENCES hypotheses(id), kind TEXT NOT NULL,
-  rationale TEXT NOT NULL, UNIQUE(evidence_id, hypothesis_id, kind)
+  rationale TEXT NOT NULL, created_at TEXT, UNIQUE(evidence_id, hypothesis_id, kind)
 );
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
@@ -182,6 +183,13 @@ CREATE TABLE IF NOT EXISTS reviews (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
   created_at TEXT NOT NULL, content_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_cadence_events (
+  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
+  research_question_id INTEGER NOT NULL REFERENCES questions(id),
+  created_at TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+  meaningful_actions INTEGER NOT NULL, evidence_ids_json TEXT NOT NULL,
+  target_keys_json TEXT NOT NULL, hypothesis_ids_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS review_retirement_rejections (
   id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL REFERENCES reviews(id),
@@ -287,6 +295,7 @@ class Database:
             "source_targets": {
                 "evidence_status": "TEXT NOT NULL DEFAULT 'unresolved'",
                 "dating_status": "TEXT NOT NULL DEFAULT 'unresolved'",
+                "state_changed_at": "TEXT",
             },
             "queries": {
                 "status": "TEXT NOT NULL DEFAULT 'active'",
@@ -331,6 +340,7 @@ class Database:
                 "primary_source_verified": "INTEGER NOT NULL DEFAULT 0",
                 "transmission_verified": "INTEGER NOT NULL DEFAULT 0",
             },
+            "relationships": {"created_at": "TEXT"},
             "runs": {
                 "provider_requests": "INTEGER NOT NULL DEFAULT 0",
                 "unknown_spend_requests": "INTEGER NOT NULL DEFAULT 0",
@@ -644,6 +654,12 @@ class Database:
 
     def _refresh_source_targets_tx(self) -> None:
         # Direct, body-text evidence closes retrieval; page metadata never closes dating.
+        before = {
+            row["id"]: (row["status"], row["evidence_status"], row["dating_status"])
+            for row in self.conn.execute(
+                "SELECT id,status,evidence_status,dating_status FROM source_targets"
+            )
+        }
         self.conn.execute(
             "UPDATE source_targets SET status='resolved',evidence_status='found',"
             "dating_status=CASE WHEN EXISTS (SELECT 1 FROM evidence e "
@@ -662,6 +678,18 @@ class Database:
             "WHERE q.source_target_id=source_targets.id AND e.primary_source_verified=1 "
             "AND e.quote_region='article_body')"
         )
+        for row in self.conn.execute(
+            "SELECT id,status,evidence_status,dating_status FROM source_targets"
+        ).fetchall():
+            if before[row["id"]] != (
+                row["status"],
+                row["evidence_status"],
+                row["dating_status"],
+            ):
+                self.conn.execute(
+                    "UPDATE source_targets SET state_changed_at=? WHERE id=?",
+                    (utc_now(), row["id"]),
+                )
         self.conn.execute(
             "UPDATE queries SET status='deferred' WHERE executed_at IS NULL "
             "AND status='active' AND source_target_id IN "
@@ -953,7 +981,7 @@ class Database:
             if row:
                 self._enforce_frontier_cap_tx(row["research_question_id"])
 
-    def review_due(self, question_id: int) -> int | None:
+    def review_due(self, question_id: int, *, allow_reviewed: bool = False) -> int | None:
         row = self.conn.execute(
             "SELECT q.id FROM queries q WHERE q.research_question_id=? "
             "AND q.executed_at IS NOT NULL AND q.reviewed_at IS NULL "
@@ -961,7 +989,107 @@ class Database:
             "AND c.assessed_at IS NULL AND c.failure_at IS NULL) ORDER BY q.id LIMIT 1",
             (question_id,),
         ).fetchone()
+        if row:
+            return int(row["id"])
+        if not allow_reviewed:
+            return None
+        row = self.conn.execute(
+            "SELECT id FROM queries WHERE research_question_id=? AND executed_at IS NOT NULL "
+            "ORDER BY executed_at DESC LIMIT 1",
+            (question_id,),
+        ).fetchone()
         return int(row["id"]) if row else None
+
+    def review_cadence_state(self, question_id: int) -> dict:
+        last = self.conn.execute(
+            "SELECT created_at FROM reviews WHERE research_question_id=? ORDER BY id DESC LIMIT 1",
+            (question_id,),
+        ).fetchone()
+        since = last["created_at"] if last else None
+        actions = self.conn.execute(
+            "SELECT COUNT(*) FROM actions a JOIN runs r ON r.id=a.run_id "
+            "WHERE r.research_question_id=? AND (? IS NULL OR a.occurred_at>?) AND ("
+            "(a.action='fetch' AND a.detail LIKE 'source_id=%') OR "
+            "(a.action='assess' AND a.detail NOT LIKE 'failed:%') OR "
+            "(a.action='interpret' AND a.detail LIKE '{%'))",
+            (question_id, since, since),
+        ).fetchone()[0]
+        searches = self.conn.execute(
+            "SELECT COUNT(*) FROM queries WHERE research_question_id=? "
+            "AND executed_at IS NOT NULL AND (? IS NULL OR executed_at>?)",
+            (question_id, since, since),
+        ).fetchone()[0]
+        evidence = self.conn.execute(
+            "SELECT e.id,e.primary_source_verified,e.evidence_type FROM evidence e "
+            "WHERE e.research_question_id=? AND (? IS NULL OR e.created_at>?) ORDER BY e.id",
+            (question_id, since, since),
+        ).fetchall()
+        contradictions = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT DISTINCT e.id FROM evidence e "
+                "JOIN relationships rel ON rel.evidence_id=e.id "
+                "JOIN hypotheses h ON h.id=rel.hypothesis_id "
+                "WHERE e.research_question_id=? "
+                "AND (? IS NULL OR e.created_at>? OR rel.created_at>?) "
+                "AND rel.kind='contradicts' AND h.archived_at IS NULL",
+                (question_id, since, since, since),
+            )
+        }
+        targets = [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT key FROM source_targets WHERE research_question_id=? "
+                "AND state_changed_at IS NOT NULL "
+                "AND (? IS NULL OR state_changed_at>?) ORDER BY id",
+                (question_id, since, since),
+            )
+        ]
+        first_run = self.conn.execute(
+            "SELECT MIN(started_at) FROM runs WHERE research_question_id=?", (question_id,)
+        ).fetchone()[0]
+        hypothesis_since = since or first_run
+        hypotheses = [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT id FROM hypotheses WHERE research_question_id=? "
+                "AND ? IS NOT NULL AND (created_at>? OR archived_at>?) ORDER BY id",
+                (question_id, hypothesis_since, hypothesis_since, hypothesis_since),
+            )
+        ]
+        important = sorted(
+            {row["id"] for row in evidence if row["primary_source_verified"]} | contradictions
+        )
+        return {
+            "last_review_at": since,
+            "meaningful_actions": actions
+            + searches
+            + len(evidence)
+            + len(targets)
+            + len(hypotheses)
+            + len(contradictions - {row["id"] for row in evidence}),
+            "evidence_ids": important,
+            "target_keys": targets,
+            "hypothesis_ids": hypotheses,
+        }
+
+    def record_review_cadence(
+        self, run_id: int, question_id: int, decision: str, reason: str, state: dict
+    ) -> None:
+        self._insert(
+            "review_cadence_events",
+            {
+                "run_id": run_id,
+                "research_question_id": question_id,
+                "created_at": utc_now(),
+                "decision": decision,
+                "reason": reason,
+                "meaningful_actions": state["meaningful_actions"],
+                "evidence_ids_json": json.dumps(state["evidence_ids"]),
+                "target_keys_json": json.dumps(state["target_keys"]),
+                "hypothesis_ids_json": json.dumps(state["hypothesis_ids"]),
+            },
+        )
 
     def mark_query_reviewed(self, query_id: int) -> None:
         with self.conn:
@@ -1489,9 +1617,9 @@ class Database:
         ):
             raise ValueError("Unrelated usage cannot establish a lineage relationship")
         self.conn.execute(
-            "INSERT OR IGNORE INTO relationships (evidence_id,hypothesis_id,kind,rationale) "
-            "VALUES (?,?,?,?)",
-            (evidence_id, hypothesis_id, kind, rationale),
+            "INSERT OR IGNORE INTO relationships "
+            "(evidence_id,hypothesis_id,kind,rationale,created_at) VALUES (?,?,?,?,?)",
+            (evidence_id, hypothesis_id, kind, rationale, utc_now()),
         )
 
     def persist_candidate_assessment(
@@ -1653,13 +1781,15 @@ class Database:
         content_json: str,
         queries: list[SearchQuery],
         exhausted_avenues: list[tuple[str, str]] | None = None,
+        *,
+        allow_repeat: bool = False,
     ) -> None:
         with self.conn:
             reviewed = self.conn.execute(
                 "SELECT reviewed_at FROM queries WHERE id=? AND research_question_id=?",
                 (query_id, question_id),
             ).fetchone()
-            if reviewed is None or reviewed["reviewed_at"] is not None:
+            if reviewed is None or (reviewed["reviewed_at"] is not None and not allow_repeat):
                 raise ValueError("Review query is missing or already reviewed")
             known_keys = {
                 row["avenue"]
