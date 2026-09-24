@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from hypertrace.config import Config
 from hypertrace.db import Database
@@ -121,16 +122,19 @@ def test_persistence_provenance_and_revision_integrity(tmp_path):
 
 
 def test_structured_llm_retries_invalid_json_and_stops():
-    calls = 0
+    requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
         body = json.loads(request.content)
+        requests.append(body)
         assert body["max_completion_tokens"] == 8000
         assert "max_tokens" not in body
-        assert "reasoning_effort" not in body
-        content = '{"relevant": true, "reason": "ok"}' if calls == 2 else "not json"
+        assert body["reasoning_effort"] == "low"
+        content = (
+            '{"relevant": true, "reason": "ok"}'
+            if len(requests) == 2
+            else '{"relevant": true, "reason": "ok",}'
+        )
         return httpx.Response(
             200,
             json={
@@ -141,11 +145,20 @@ def test_structured_llm_retries_invalid_json_and_stops():
 
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client, max_retries=1)
-            result = await llm.complete("model", "system", "user", PageAssessment)
+            llm = OpenAICompatibleLLM(
+                "https://api.cheaperinference.com/v1", "key", client=client, max_retries=0
+            )
+            result = await llm.complete(
+                "glm-5.3-flash", "system", "private research context", PageAssessment
+            )
             assert result.value.relevant is True
             assert result.input_tokens == 20  # Both attempts count toward cost.
-        assert calls == 2
+        assert len(requests) == 2
+        assert len(requests[1]["messages"]) == 2
+        assert "private research context" not in str(requests[1]["messages"])
+        assert '{"relevant": true, "reason": "ok",}' in requests[1]["messages"][1]["content"]
+        assert "JSON parse error" in requests[1]["messages"][1]["content"]
+        assert "do not invent" in requests[1]["messages"][0]["content"]
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
                 lambda _: httpx.Response(200, json={"choices": [{"message": {"content": "bad"}}]})
@@ -156,6 +169,31 @@ def test_structured_llm_retries_invalid_json_and_stops():
                 await llm.complete("model", "system", "user", PageAssessment)
 
     asyncio.run(exercise())
+
+
+def test_fenced_json_validates_without_another_provider_call():
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": ' \n```json\n{"overclaims": ["unsupported"]}\n``` \n'}}
+                ]
+            },
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM("https://llm.example/v1", "key", client=client)
+            result = await llm.complete("model", "system", "context", AdversarialReview)
+            assert result.value.overclaims == ["unsupported"]
+
+    asyncio.run(exercise())
+    assert calls == 1
 
 
 def test_page_assessment_valid_json_schema_error_gets_one_repair_call():
@@ -1235,9 +1273,12 @@ def test_reasoning_only_page_assessment_stops_and_resumes_without_duplicate_work
                     (first,),
                 )
                 assert len(attempts) == 2
-                for attempt in attempts:
+                for kind, attempt in zip(("initial", "retry"), attempts, strict=True):
                     assert attempt["outcome"] == "provider_output_failure"
                     diagnostics = json.loads(attempt["diagnostics_json"])
+                    assert diagnostics["attempt_kind"] == kind
+                    assert diagnostics["structured_content_state"] == "empty"
+                    assert diagnostics["content_sha256"] == hashlib.sha256(b"").hexdigest()
                     assert diagnostics["http_status"] == 200
                     assert diagnostics["finish_reason"] == "length"
                     assert diagnostics["content_chars"] == 0
@@ -1385,7 +1426,11 @@ def test_review_failed_after_invalid_repair_remains_due(tmp_path):
         requests += 1
         return httpx.Response(
             200,
-            json={"choices": [{"message": {"content": '{"overclaims": "still invalid"}'}}]},
+            json={
+                "choices": [
+                    {"message": {"content": '{"next_queries": [{"query": "hyperpop origin"}]}'}}
+                ]
+            },
         )
 
     async def exercise():
@@ -1405,10 +1450,110 @@ def test_review_failed_after_invalid_repair_remains_due(tmp_path):
                 assert tuple(run) == ("stopped", "review_failed")
                 assert db.review_due(qid) == query_id
                 assert len(db.rows("SELECT * FROM review_attempts")) == 1
-                assert len(db.rows("SELECT * FROM provider_attempts")) == 2
+                attempts = db.rows(
+                    "SELECT diagnostics_json FROM provider_attempts WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                )
+                assert len(attempts) == 2
+                first, second = (json.loads(row["diagnostics_json"]) for row in attempts)
+                assert first["attempt_kind"] == "initial"
+                assert second["attempt_kind"] == "repair"
+                assert first["structured_content_state"] == "valid_json_schema_invalid"
+                with pytest.raises(ValidationError) as expected:
+                    AdversarialReview.model_validate_json(
+                        '{"next_queries": [{"query": "hyperpop origin"}]}'
+                    )
+                assert first["validation_errors"] == json.loads(
+                    json.dumps(expected.value.errors(include_input=False, include_url=False))
+                )
+                assert first["validation_errors"][0]["loc"] == ["next_queries", 0, "rationale"]
+                assert len(first["response_preview"]) <= 323
+                assert "hyperpop origin" not in first["response_preview"]
+                assert json.loads(
+                    db.rows("SELECT diagnostics_json FROM review_attempts")[0][0]
+                ) == [
+                    first,
+                    second,
+                ]
 
     asyncio.run(exercise())
     assert requests == 2
+
+
+def test_malformed_review_repair_failure_is_diagnostic_and_remains_due(tmp_path, caplog):
+    requests = []
+    malformed = '{"overclaims": ["secret-key"]' + " " * 1000 + ",}"
+    reasoning = "private reasoning_content"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": malformed, "reasoning_content": reasoning},
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLM(
+                "https://api.cheaperinference.com/v1", "secret-key", client=client, max_retries=0
+            )
+            config = replace(_config(tmp_path), review_model="glm-5.3-flash")
+            with Database(config.db_path) as db:
+                qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+                query_id = db.add_query(
+                    SearchQuery(research_question_id=qid, query="hyperpop origin")
+                )
+                db.mark_query_executed(query_id)
+                run_id = await Researcher(
+                    db, llm, FakeRetrieval(), config, qid, Limits(max_actions=2)
+                ).run()
+                run = db.rows("SELECT status,stop_reason FROM runs WHERE id=?", (run_id,))[0]
+                assert tuple(run) == ("stopped", "review_failed")
+                assert db.review_due(qid) == query_id
+                assert db.rows("SELECT id FROM reviews WHERE run_id=?", (run_id,)) == []
+                attempts = db.rows(
+                    "SELECT diagnostics_json FROM provider_attempts WHERE run_id=? ORDER BY id",
+                    (run_id,),
+                )
+                assert len(attempts) == 2
+                with pytest.raises(json.JSONDecodeError) as expected:
+                    json.loads(malformed)
+                for kind, row in zip(("initial", "repair"), attempts, strict=True):
+                    diagnostics = json.loads(row["diagnostics_json"])
+                    assert diagnostics["attempt_kind"] == kind
+                    assert diagnostics["structured_content_state"] == "malformed_json"
+                    assert diagnostics["json_parse_error"] == {
+                        "message": expected.value.msg,
+                        "line": expected.value.lineno,
+                        "column": expected.value.colno,
+                        "position": expected.value.pos,
+                    }
+                    assert diagnostics["content_chars"] == len(malformed)
+                    assert (
+                        diagnostics["content_sha256"]
+                        == hashlib.sha256(malformed.encode()).hexdigest()
+                    )
+                    assert len(diagnostics["response_preview"]) <= 323
+                    assert "secret-key" not in json.dumps(diagnostics)
+                    assert reasoning not in json.dumps(diagnostics)
+                persisted = db.rows("SELECT diagnostics_json FROM review_attempts")[0][0]
+                assert "secret-key" not in persisted
+                assert reasoning not in persisted
+
+    caplog.set_level(logging.INFO, logger="hypertrace.llm.openai_compatible")
+    asyncio.run(exercise())
+    assert len(requests) == 2
+    assert all(request["reasoning_effort"] == "low" for request in requests)
+    assert "secret-key" not in "\n".join(record.message for record in caplog.records)
+    assert reasoning not in "\n".join(record.message for record in caplog.records)
 
 
 def test_provider_error_diagnostics_redact_credentials_and_response_text(caplog):

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 from hypertrace.llm.base import LLMResult, T
 
 logger = logging.getLogger(__name__)
+PREVIEW_END_CHARS = 160
 
 
 class AttemptObserver(Protocol):
@@ -111,6 +113,35 @@ def _response_diagnostics(status: int | None, payload: object, secret: str = "")
     }
 
 
+def _sanitized_preview(content: str) -> str:
+    if len(content) > PREVIEW_END_CHARS * 2:
+        content = f"{content[:PREVIEW_END_CHARS]}\n…\n{content[-PREVIEW_END_CHARS:]}"
+    # Preserve punctuation, whitespace, and fence shape without storing response text.
+    return "".join("x" if char.isalnum() or char == "_" else char for char in content)
+
+
+def _repair_messages(schema_text: str, content: str, error: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Repair this response to match the JSON schema: "
+                f"{schema_text}. Preserve every substantive value and statement. "
+                "Do not add findings, queries, evidence, or claims. If required information "
+                "is absent, leave it absent; do not invent it. Return only corrected JSON; "
+                "spend minimal reasoning."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Correct only the representation; do not redo the review or research.\n"
+                f"Invalid response: {content}\nValidation error: {error}"
+            ),
+        },
+    ]
+
+
 class OpenAICompatibleLLM:
     def __init__(
         self,
@@ -158,6 +189,7 @@ class OpenAICompatibleLLM:
         repair_pending = False
         for attempt in range(self.max_retries + 2):
             is_repair = repair_pending
+            attempt_kind = "repair" if is_repair else "initial" if attempt == 0 else "retry"
             body: dict = {
                 "model": model,
                 "messages": messages,
@@ -174,6 +206,7 @@ class OpenAICompatibleLLM:
             attempt_output: int | None = None
             outcome = "unknown_failure"
             diagnostics: dict = _response_diagnostics(None, None, self.api_key)
+            diagnostics["attempt_kind"] = attempt_kind
             try:
                 response = await self.client.post(
                     f"{self.base_url}/chat/completions",
@@ -186,6 +219,7 @@ class OpenAICompatibleLLM:
                 except json.JSONDecodeError:
                     payload = None
                 diagnostics = _response_diagnostics(response.status_code, payload, self.api_key)
+                diagnostics["attempt_kind"] = attempt_kind
                 diagnostics["max_completion_tokens"] = policy.max_completion_tokens
                 diagnostics["reasoning_effort_requested"] = policy.reasoning_effort
                 response.raise_for_status()
@@ -212,7 +246,10 @@ class OpenAICompatibleLLM:
                     raise ProviderOutputError("Provider returned no completion message")
                 content = choice["message"].get("content")
                 diagnostics["content_chars"] = len(content) if isinstance(content, str) else None
+                if isinstance(content, str):
+                    diagnostics["content_sha256"] = sha256(content.encode()).hexdigest()
                 if content is None or (isinstance(content, str) and not content.strip()):
+                    diagnostics["structured_content_state"] = "empty"
                     raise ProviderOutputError(
                         f"Provider returned {diagnostics['content_state']} completion content"
                     )
@@ -220,38 +257,46 @@ class OpenAICompatibleLLM:
                     raise ProviderOutputError("Provider returned non-string completion content")
                 if choice.get("finish_reason") == "length":
                     raise ProviderOutputError("Provider stopped at the completion token limit")
+                normalized = content.strip()
+                fence = re.fullmatch(
+                    r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", normalized, re.DOTALL | re.IGNORECASE
+                )
+                if fence:
+                    normalized = fence.group(1).strip()
                 try:
-                    value = schema.model_validate_json(content)
+                    invalid_object = json.loads(normalized)
+                except json.JSONDecodeError as exc:
+                    diagnostics["structured_content_state"] = "malformed_json"
+                    diagnostics["json_parse_error"] = {
+                        "message": exc.msg,
+                        "line": exc.lineno,
+                        "column": exc.colno,
+                        "position": exc.pos,
+                    }
+                    diagnostics["response_preview"] = _sanitized_preview(content)
+                    if not is_repair:
+                        messages = _repair_messages(
+                            schema_text, content, f"JSON parse error: {exc}"
+                        )
+                        repair_pending = True
+                    raise StructuredOutputError(
+                        f"Completion contained malformed JSON: {exc}"
+                    ) from exc
+                try:
+                    value = schema.model_validate_json(normalized)
                 except ValidationError as exc:
                     error_types = sorted({item["type"] for item in exc.errors()})
+                    errors = exc.errors(include_input=False, include_url=False)
+                    diagnostics["structured_content_state"] = "valid_json_schema_invalid"
+                    diagnostics["validation_errors"] = errors
+                    diagnostics["response_preview"] = _sanitized_preview(content)
                     if not is_repair:
-                        try:
-                            invalid_object = json.loads(content)
-                        except json.JSONDecodeError:
-                            pass
-                        else:
-                            errors = exc.errors(
-                                include_input=False, include_context=False, include_url=False
-                            )
-                            messages = [
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "Correct the JSON object to match this schema: "
-                                        f"{schema_text}. Return only JSON; spend minimal reasoning."
-                                    ),
-                                },
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        "Correct this JSON object to match the schema. "
-                                        "Return only the corrected JSON object; do not redo the review.\n"
-                                        f"Invalid object: {json.dumps(invalid_object, ensure_ascii=False)}\n"
-                                        f"Schema validation errors: {json.dumps(errors, ensure_ascii=False)}"
-                                    ),
-                                },
-                            ]
-                            repair_pending = True
+                        messages = _repair_messages(
+                            schema_text,
+                            json.dumps(invalid_object, ensure_ascii=False),
+                            f"Schema validation errors: {json.dumps(errors, ensure_ascii=False)}",
+                        )
+                        repair_pending = True
                     raise StructuredOutputError(
                         f"Completion failed schema validation: {', '.join(error_types)}"
                     ) from exc
