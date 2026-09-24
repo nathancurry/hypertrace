@@ -126,6 +126,15 @@ CREATE TABLE IF NOT EXISTS query_target_proposals (
   reason TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL,
   UNIQUE(candidate_id,query_id,source_target_key,target_purpose)
 );
+CREATE TABLE IF NOT EXISTS candidate_query_rejections (
+  id INTEGER PRIMARY KEY,
+  candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+  query_text TEXT NOT NULL, rationale TEXT NOT NULL,
+  source_target_key TEXT NOT NULL,
+  target_purpose TEXT NOT NULL CHECK(target_purpose IN ('source','dating')),
+  reason TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(candidate_id,query_text,source_target_key,target_purpose)
+);
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
@@ -1512,6 +1521,23 @@ class Database:
             for query in queries:
                 if query.research_question_id != candidate["research_question_id"]:
                     raise ValueError("Query belongs to another research question")
+                rejection = self._candidate_query_rejection_reason_tx(query)
+                if rejection is not None:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO candidate_query_rejections "
+                        "(candidate_id,query_text,rationale,source_target_key,"
+                        "target_purpose,reason,created_at) VALUES (?,?,?,?,?,?,?)",
+                        (
+                            candidate_id,
+                            query.query,
+                            query.rationale,
+                            query.source_target or "",
+                            query.target_purpose,
+                            rejection,
+                            utc_now(),
+                        ),
+                    )
+                    continue
                 if not self._record_candidate_query_collision_tx(candidate_id, candidate, query):
                     self._add_query_tx(query, proposed=True)
             self.conn.execute(
@@ -1521,6 +1547,28 @@ class Database:
                 (utc_now(), mode, candidate_id),
             )
         return len(evidence)
+
+    def _candidate_query_rejection_reason_tx(self, query: SearchQuery) -> str | None:
+        if query.source_target is None:
+            return (
+                "Dating query requires a source target"
+                if query.target_purpose == "dating"
+                else None
+            )
+        target = self.conn.execute(
+            "SELECT status,dating_status FROM source_targets "
+            "WHERE research_question_id=? AND key=?",
+            (query.research_question_id, query.source_target),
+        ).fetchone()
+        if target is None:
+            return "Unknown source target"
+        if query.target_purpose == "source":
+            return "Source discovery already resolved" if target["status"] == "resolved" else None
+        if target["status"] != "resolved":
+            return "Source evidence unresolved; dating query unavailable"
+        if target["dating_status"] == "resolved":
+            return "Dating already resolved"
+        return None
 
     def _record_candidate_query_collision_tx(
         self, candidate_id: int, candidate: sqlite3.Row, query: SearchQuery

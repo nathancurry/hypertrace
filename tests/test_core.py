@@ -1449,6 +1449,176 @@ def test_candidate_collision_rolls_back_and_retries_once_after_reopen(tmp_path, 
         assert len(db.rows("SELECT id FROM query_target_proposals")) == 1
 
 
+@pytest.mark.parametrize(
+    ("target", "status", "dating_status", "purpose", "reason"),
+    [
+        ("pc-music-2014", "resolved", "resolved", "source", "Source discovery already resolved"),
+        ("pc-music-2014", "resolved", "unresolved", "dating", None),
+        ("pc-music-2014", "resolved", "unresolved", "source", "Source discovery already resolved"),
+        ("missing-target", "unresolved", "unresolved", "source", "Unknown source target"),
+        (
+            "scene-2014-2018",
+            "unresolved",
+            "unresolved",
+            "dating",
+            "Source evidence unresolved; dating query unavailable",
+        ),
+    ],
+)
+def test_candidate_proposal_target_boundary(
+    tmp_path, target, status, dating_status, purpose, reason
+):
+    with Database(tmp_path / "db.sqlite") as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        db.install_source_targets(
+            qid,
+            [("pc-music-2014", "Pitchfork article"), ("scene-2014-2018", "Scene usage")],
+            [],
+        )
+        db.conn.execute(
+            "UPDATE source_targets SET status=?,evidence_status=?,dating_status=? "
+            "WHERE research_question_id=? AND key=?",
+            (status, "found" if status == "resolved" else "unresolved", dating_status, qid, target),
+        )
+        origin = db.add_query(SearchQuery(research_question_id=qid, query="unrelated source hunt"))
+        db.add_candidate(origin, "https://example.org/page", "Page")
+        candidate = db.pending_candidate(qid)["id"]
+        db.set_candidate_source(
+            candidate, db.add_source(_source("https://example.org/page", "Text"))
+        )
+        proposal = SearchQuery(
+            research_question_id=qid,
+            query="exact proposed query",
+            rationale="Exact model rationale",
+            gap="Unresolved research gap",
+            novelty="New search approach",
+            source_target=target,
+            target_purpose=purpose,
+        )
+        db.persist_candidate_assessment(candidate, [], [], [proposal])
+
+        rejections = db.rows("SELECT * FROM candidate_query_rejections")
+        inserted = db.rows("SELECT * FROM queries WHERE query=?", (proposal.query,))
+        if reason is None:
+            assert not rejections
+            assert len(inserted) == 1
+            assert inserted[0]["target_purpose"] == "dating"
+        else:
+            assert not inserted
+            assert len(rejections) == 1
+            rejection = rejections[0]
+            assert (
+                rejection["candidate_id"],
+                rejection["query_text"],
+                rejection["rationale"],
+                rejection["source_target_key"],
+                rejection["target_purpose"],
+                rejection["reason"],
+            ) == (candidate, proposal.query, proposal.rationale, target, purpose, reason)
+        if target != "missing-target":
+            target_row = db.rows(
+                "SELECT status,evidence_status,dating_status FROM source_targets WHERE key=?",
+                (target,),
+            )[0]
+            assert tuple(target_row) == (
+                status,
+                "found" if status == "resolved" else "unresolved",
+                dating_status,
+            )
+
+
+def test_candidate_mixed_valid_and_invalid_proposals_resume_atomically(tmp_path, monkeypatch):
+    path = tmp_path / "db.sqlite"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        db.install_source_targets(
+            qid,
+            [
+                ("scene-2014-2018", "Scene usage"),
+                ("spotify-naming", "Spotify naming"),
+                ("pc-music-2014", "Pitchfork article"),
+            ],
+            [],
+        )
+        db.conn.execute(
+            "UPDATE source_targets SET status='resolved',evidence_status='found',"
+            "dating_status='resolved' WHERE research_question_id=? AND key='pc-music-2014'",
+            (qid,),
+        )
+        origin = db.add_query(SearchQuery(research_question_id=qid, query="Wayback CDX guide"))
+        db.add_candidate(origin, "https://example.org/guide", "Guide")
+        candidate = db.pending_candidate(qid)["id"]
+        sid = db.add_source(_source("https://example.org/guide", "The guide explains CDX."))
+        db.set_candidate_source(candidate, sid)
+        evidence = Evidence(
+            source_id=sid,
+            research_question_id=qid,
+            exact_quote="explains CDX",
+            normalized_claim="explains CDX",
+            evidence_type="interpretive_context",
+        )
+        lead = ResearchLead(research_question_id=qid, source_id=sid, kind="other", value="CDX")
+        invalid_dating = SearchQuery(
+            research_question_id=qid,
+            query="date scene Tumblr usage",
+            rationale="Use CDX to date scene usage",
+            gap="Scene source is missing",
+            novelty="New archive approach",
+            source_target="scene-2014-2018",
+            target_purpose="dating",
+        )
+        stale = SearchQuery(
+            research_question_id=qid,
+            query="find Pitchfork article again",
+            rationale="Repeat the Pitchfork source search",
+            gap="Model claims source is missing",
+            novelty="New search terms",
+            source_target="pc-music-2014",
+            target_purpose="source",
+        )
+        valid = SearchQuery(
+            research_question_id=qid,
+            query="Spotify naming archive",
+            rationale="Search archived Spotify pages",
+            gap="Naming account is missing",
+            novelty="New archive approach",
+            source_target="spotify-naming",
+            target_purpose="source",
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                db, "_add_query_tx", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("crash"))
+            )
+            with pytest.raises(RuntimeError, match="crash"):
+                db.persist_candidate_assessment(
+                    candidate, [(evidence, [])], [lead], [stale, invalid_dating, valid]
+                )
+        assert not db.rows("SELECT id FROM evidence")
+        assert not db.rows("SELECT id FROM leads")
+        assert not db.rows("SELECT id FROM candidate_query_rejections")
+        assert db.pending_candidate(qid)["id"] == candidate
+
+    with Database(path) as db:
+        assert (
+            db.persist_candidate_assessment(
+                candidate, [(evidence, [])], [lead], [stale, invalid_dating, valid]
+            )
+            == 1
+        )
+        assert db.pending_candidate(qid) is None
+        assert len(db.rows("SELECT id FROM evidence")) == 1
+        assert len(db.rows("SELECT id FROM leads")) == 1
+        assert len(db.rows("SELECT id FROM candidate_query_rejections")) == 2
+        assert len(db.rows("SELECT id FROM queries WHERE query=?", (valid.query,))) == 1
+        assert not db.rows("SELECT id FROM queries WHERE query=?", (stale.query,))
+        assert not db.rows("SELECT id FROM queries WHERE query=?", (invalid_dating.query,))
+        with pytest.raises(ValueError, match="unavailable"):
+            db.persist_candidate_assessment(
+                candidate, [(evidence, [])], [lead], [stale, invalid_dating, valid]
+            )
+        assert len(db.rows("SELECT id FROM candidate_query_rejections")) == 2
+
+
 def test_unverified_transmission_and_status_remain_provisional(tmp_path):
     with Database(tmp_path / "db.sqlite") as db:
         qid = db.add_question(ResearchQuestion(question="Did modern hyperpop borrow a name?"))
