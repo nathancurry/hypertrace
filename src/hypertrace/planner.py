@@ -122,6 +122,8 @@ outside the schema. Use at most 3 short items in each concern or test list, and 
 next_queries. Each query needs gap, information_value (high/medium/low), novelty
 relative to prior searches, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Prefer original sources behind attributed claims.
-List existing avenue keys and a concrete reason in exhausted_avenues only when adequately
-answered or repeated searches produced no evidence. Use empty lists when there is no
+For exhausted_avenues, copy exactly one avenue_id from the supplied avenues list or
+reviewed_query.avenue_id per item,
+with a concrete reason, only when adequately answered or repeated searches produced no evidence.
+Never combine IDs or write a description in avenue_id. Use empty lists when there is no
 supported finding."""

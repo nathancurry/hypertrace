@@ -431,8 +431,9 @@ class Researcher:
         avenues = [
             dict(row)
             for row in self.db.rows(
-                "SELECT avenue,COUNT(*) searches FROM queries WHERE research_question_id=? "
-                "AND status!='rejected_duplicate' AND avenue!='' GROUP BY avenue "
+                "SELECT avenue AS avenue_id,MIN(query) AS example_query,COUNT(*) searches "
+                "FROM queries WHERE research_question_id=? "
+                "AND status IN ('active','deferred') AND avenue!='' GROUP BY avenue "
                 "ORDER BY MAX(id) DESC LIMIT 30",
                 (self.question_id,),
             )
@@ -765,7 +766,8 @@ class Researcher:
             context = self._context()
             context["reviewed_query"] = dict(
                 self.db.rows(
-                    "SELECT id,query,avenue FROM queries WHERE id=? AND research_question_id=?",
+                    "SELECT id,query,avenue AS avenue_id FROM queries "
+                    "WHERE id=? AND research_question_id=?",
                     (query_id, self.question_id),
                 )[0]
             )
@@ -806,7 +808,7 @@ class Researcher:
                 )
                 for lead in review.next_queries
             ],
-            [(item.avenue, item.reason) for item in review.exhausted_avenues],
+            [(item.avenue_id, item.reason) for item in review.exhausted_avenues],
         )
 
     async def run(self) -> int:

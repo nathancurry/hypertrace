@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 def utc_now() -> str:
@@ -260,7 +260,7 @@ class HypothesisScreen(BaseModel):
 
 
 class AvenueRetirement(BaseModel):
-    avenue: str = Field(min_length=1)
+    avenue_id: str = Field(min_length=1, validation_alias=AliasChoices("avenue_id", "avenue"))
     reason: str = Field(min_length=3)
 
 

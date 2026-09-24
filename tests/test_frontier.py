@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from hypertrace.db import SCHEMA, Database
-from hypertrace.models import ResearchQuestion, ResearchRun, SearchQuery
+from hypertrace.models import AdversarialReview, ResearchQuestion, ResearchRun, SearchQuery
 
 
 def proposed(question_id: int, query: str, *, value: str = "high") -> SearchQuery:
@@ -77,6 +79,70 @@ def test_frontier_cap_and_exhausted_avenue(tmp_path):
         variant = db.add_query(proposed(qid, "1988 Don Shewey Cocteau Twins archive original"))
         assert db.rows("SELECT status FROM queries WHERE id=?", (variant,))[0][0] == "exhausted"
         assert db.rows("SELECT reason FROM exhausted_avenues WHERE avenue=?", (key,))[0][0]
+
+
+def test_review_retirement_ids_are_advisory_and_resume_is_exactly_once(tmp_path):
+    path = tmp_path / "db.sqlite"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        reviewed_id = db.add_query(proposed(qid, "Björk Hyperballad title original interview"))
+        valid_id = db.add_query(
+            proposed(qid, "Philip Sherburne Pitchfork 2014 hyper-pop original text")
+        )
+        untouched_id = db.add_query(proposed(qid, "Glenn McDonald EveryNoise hyperpop interview"))
+        valid_key = db.rows("SELECT avenue FROM queries WHERE id=?", (valid_id,))[0][0]
+        db.mark_query_executed(reviewed_id)
+        run_id = db.start_run(ResearchRun(research_question_id=qid, model="test", provider="test"))
+        next_query = proposed(qid, "Glenn McDonald Spotify hyperpop direct statement")
+        composite = (
+            "words:hyperballad-hyperpop-influence (and variants: "
+            "ag-bj-cook-hyperballad-influence, 100-bj-gecs-genre-hyperpop-influence, "
+            "1990s-2000s-ballad-criticism-genre-hyper-hyperballad-label-music)"
+        )
+        review = AdversarialReview.model_validate(
+            {
+                "exhausted_avenues": [
+                    {"avenue": composite, "reason": "Several searches found no evidence"}
+                ]
+            }
+        )
+        assert review.exhausted_avenues[0].avenue_id == composite
+        db.persist_review(
+            run_id,
+            qid,
+            reviewed_id,
+            review.model_dump_json(),
+            [next_query],
+            [
+                (valid_key, "Original text resolves this avenue"),
+                ("unknown-avenue-id", "No useful evidence"),
+                (composite, "Several searches found no evidence"),
+            ],
+        )
+        assert db.rows("SELECT status FROM queries WHERE id=?", (valid_id,))[0][0] == "exhausted"
+        assert db.rows("SELECT status FROM queries WHERE id=?", (untouched_id,))[0][0] == "active"
+        assert db.rows("SELECT COUNT(*) FROM exhausted_avenues")[0][0] == 1
+        assert db.rows("SELECT COUNT(*) FROM reviews")[0][0] == 1
+        assert db.rows("SELECT COUNT(*) FROM queries WHERE query=?", (next_query.query,))[0][0] == 1
+        assert [
+            tuple(row)
+            for row in db.rows(
+                "SELECT avenue_id,reason,rejection_reason "
+                "FROM review_retirement_rejections ORDER BY id"
+            )
+        ] == [
+            ("unknown-avenue-id", "No useful evidence", "Unknown avenue ID"),
+            (composite, "Several searches found no evidence", "Not an exact avenue ID"),
+        ]
+        assert db.review_due(qid) is None
+    with Database(path) as db:
+        assert db.review_due(qid) is None
+        assert db.rows("SELECT COUNT(*) FROM reviews")[0][0] == 1
+        assert db.rows("SELECT COUNT(*) FROM review_retirement_rejections")[0][0] == 2
+        assert db.rows("SELECT COUNT(*) FROM queries WHERE query=?", (next_query.query,))[0][0] == 1
+        with pytest.raises(ValueError, match="already reviewed"):
+            db.persist_review(run_id, qid, reviewed_id, "{}", [next_query])
+        assert db.rows("SELECT COUNT(*) FROM reviews")[0][0] == 1
 
 
 def test_legacy_migration_preserves_query_provenance(tmp_path):

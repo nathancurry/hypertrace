@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS reviews (
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
   created_at TEXT NOT NULL, content_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS review_retirement_rejections (
+  id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL REFERENCES reviews(id),
+  avenue_id TEXT NOT NULL, reason TEXT NOT NULL, rejection_reason TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS review_attempts (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
@@ -1095,11 +1099,25 @@ class Database:
         exhausted_avenues: list[tuple[str, str]] | None = None,
     ) -> None:
         with self.conn:
-            self.conn.execute(
+            reviewed = self.conn.execute(
+                "SELECT reviewed_at FROM queries WHERE id=? AND research_question_id=?",
+                (query_id, question_id),
+            ).fetchone()
+            if reviewed is None or reviewed["reviewed_at"] is not None:
+                raise ValueError("Review query is missing or already reviewed")
+            known_keys = {
+                row["avenue"]
+                for row in self.conn.execute(
+                    "SELECT DISTINCT avenue FROM queries WHERE research_question_id=? "
+                    "AND status IN ('active','deferred','executed')",
+                    (question_id,),
+                )
+            }
+            review_id = self.conn.execute(
                 "INSERT INTO reviews (run_id,research_question_id,created_at,content_json) "
                 "VALUES (?,?,?,?)",
                 (run_id, question_id, utc_now(), content_json),
-            )
+            ).lastrowid
             for query in queries:
                 if query.research_question_id != question_id:
                     raise ValueError("Review query belongs to another question")
@@ -1109,7 +1127,29 @@ class Database:
                 (utc_now(), query_id, question_id),
             )
             for key, reason in exhausted_avenues or []:
-                self._retire_avenue_tx(question_id, key, reason)
+                if not key or key != key.strip() or any(char.isspace() for char in key):
+                    rejection = "Not an exact avenue ID"
+                elif not reason.strip():
+                    rejection = "Retirement reason is empty"
+                elif self.conn.execute(
+                    "SELECT 1 FROM exhausted_avenues WHERE research_question_id=? AND avenue=?",
+                    (question_id, key),
+                ).fetchone():
+                    rejection = "Avenue already retired"
+                elif key not in known_keys:
+                    known = self.conn.execute(
+                        "SELECT 1 FROM queries WHERE research_question_id=? AND avenue=?",
+                        (question_id, key),
+                    ).fetchone()
+                    rejection = "No reviewable avenue" if known else "Unknown avenue ID"
+                else:
+                    self._retire_avenue_tx(question_id, key, reason)
+                    continue
+                self.conn.execute(
+                    "INSERT INTO review_retirement_rejections "
+                    "(review_id,avenue_id,reason,rejection_reason) VALUES (?,?,?,?)",
+                    (review_id, key, reason, rejection),
+                )
             reviewed = self.conn.execute(
                 "SELECT avenue FROM queries WHERE id=? AND research_question_id=?",
                 (query_id, question_id),
