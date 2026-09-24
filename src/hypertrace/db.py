@@ -187,6 +187,16 @@ CREATE TABLE IF NOT EXISTS review_retirement_rejections (
   id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL REFERENCES reviews(id),
   avenue_id TEXT NOT NULL, reason TEXT NOT NULL, rejection_reason TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS review_query_rejections (
+  id INTEGER PRIMARY KEY,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  query_text TEXT NOT NULL, rationale TEXT NOT NULL,
+  source_target_key TEXT NOT NULL,
+  target_purpose TEXT NOT NULL CHECK(target_purpose IN ('source','dating')),
+  reason TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(review_id,query_text,source_target_key,target_purpose)
+);
 CREATE TABLE IF NOT EXISTS review_attempts (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
@@ -1521,7 +1531,7 @@ class Database:
             for query in queries:
                 if query.research_question_id != candidate["research_question_id"]:
                     raise ValueError("Query belongs to another research question")
-                rejection = self._candidate_query_rejection_reason_tx(query)
+                rejection = self._query_rejection_reason_tx(query)
                 if rejection is not None:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO candidate_query_rejections "
@@ -1548,7 +1558,7 @@ class Database:
             )
         return len(evidence)
 
-    def _candidate_query_rejection_reason_tx(self, query: SearchQuery) -> str | None:
+    def _query_rejection_reason_tx(self, query: SearchQuery) -> str | None:
         if query.source_target is None:
             return (
                 "Dating query requires a source target"
@@ -1667,6 +1677,39 @@ class Database:
             for query in queries:
                 if query.research_question_id != question_id:
                     raise ValueError("Review query belongs to another question")
+                rejection = self._query_rejection_reason_tx(query)
+                if rejection is None and query.source_target is not None:
+                    existing = self.conn.execute(
+                        "SELECT source_target_id,target_purpose FROM queries "
+                        "WHERE research_question_id=? AND query=?",
+                        (question_id, query.query),
+                    ).fetchone()
+                    if existing is not None and existing["source_target_id"] is not None:
+                        target_id = self.conn.execute(
+                            "SELECT id FROM source_targets WHERE research_question_id=? AND key=?",
+                            (question_id, query.source_target),
+                        ).fetchone()["id"]
+                        if existing["source_target_id"] != target_id:
+                            rejection = "Query already belongs to another source target"
+                        elif existing["target_purpose"] != query.target_purpose:
+                            rejection = "Query already has another target purpose"
+                if rejection is not None:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO review_query_rejections "
+                        "(review_id,run_id,query_text,rationale,source_target_key,"
+                        "target_purpose,reason,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            review_id,
+                            run_id,
+                            query.query,
+                            query.rationale,
+                            query.source_target or "",
+                            query.target_purpose,
+                            rejection,
+                            utc_now(),
+                        ),
+                    )
+                    continue
                 self._add_query_tx(query, proposed=True)
             self.conn.execute(
                 "UPDATE queries SET reviewed_at=? WHERE id=? AND research_question_id=?",

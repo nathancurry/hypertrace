@@ -1619,6 +1619,185 @@ def test_candidate_mixed_valid_and_invalid_proposals_resume_atomically(tmp_path,
         assert len(db.rows("SELECT id FROM candidate_query_rejections")) == 2
 
 
+@pytest.mark.parametrize(
+    ("target", "status", "dating_status", "purpose", "reason"),
+    [
+        (
+            "spotify-naming",
+            "unresolved",
+            "unresolved",
+            "dating",
+            "Source evidence unresolved; dating query unavailable",
+        ),
+        ("pc-music-2014", "resolved", "unresolved", "dating", None),
+        ("pc-music-2014", "resolved", "unresolved", "source", "Source discovery already resolved"),
+        ("pc-music-2014", "resolved", "resolved", "source", "Source discovery already resolved"),
+        ("pc-music-2014", "resolved", "resolved", "dating", "Dating already resolved"),
+        ("missing-target", "unresolved", "unresolved", "source", "Unknown source target"),
+    ],
+)
+def test_review_proposal_uses_candidate_target_boundary(
+    tmp_path, target, status, dating_status, purpose, reason
+):
+    with Database(tmp_path / "db.sqlite") as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        db.install_source_targets(
+            qid,
+            [("spotify-naming", "Spotify naming"), ("pc-music-2014", "Pitchfork article")],
+            [],
+        )
+        db.conn.execute(
+            "UPDATE source_targets SET status=?,evidence_status=?,dating_status=? "
+            "WHERE research_question_id=? AND key=?",
+            (status, "found" if status == "resolved" else "unresolved", dating_status, qid, target),
+        )
+        reviewed_query = db.add_query(
+            SearchQuery(research_question_id=qid, query="archive research")
+        )
+        db.mark_query_executed(reviewed_query)
+        run_id = db.start_run(ResearchRun(research_question_id=qid, model="model", provider="test"))
+        proposal = SearchQuery(
+            research_question_id=qid,
+            query="exact proposed review query",
+            rationale="Exact model rationale",
+            gap="Unresolved research gap",
+            novelty="New search approach",
+            source_target=target,
+            target_purpose=purpose,
+        )
+        db.persist_review(run_id, qid, reviewed_query, "{}", [proposal])
+
+        assert db.review_due(qid) is None
+        review = db.rows("SELECT id FROM reviews WHERE run_id=?", (run_id,))[0]
+        inserted = db.rows("SELECT id,target_purpose FROM queries WHERE query=?", (proposal.query,))
+        rejections = db.rows("SELECT * FROM review_query_rejections")
+        if reason is None:
+            assert len(inserted) == 1
+            assert inserted[0]["target_purpose"] == purpose
+            assert not rejections
+        else:
+            assert not inserted
+            assert len(rejections) == 1
+            rejected = rejections[0]
+            assert (
+                rejected["review_id"],
+                rejected["run_id"],
+                rejected["query_text"],
+                rejected["rationale"],
+                rejected["source_target_key"],
+                rejected["target_purpose"],
+                rejected["reason"],
+            ) == (review["id"], run_id, proposal.query, proposal.rationale, target, purpose, reason)
+
+
+def test_review_mixed_proposals_and_retirement_retry_once(tmp_path, monkeypatch):
+    path = tmp_path / "db.sqlite"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        db.install_source_targets(
+            qid,
+            [("spotify-naming", "Spotify naming"), ("pc-music-2014", "Pitchfork article")],
+            [],
+        )
+        db.conn.execute(
+            "UPDATE source_targets SET status='resolved',evidence_status='found' "
+            "WHERE research_question_id=? AND key='pc-music-2014'",
+            (qid,),
+        )
+        reviewed_query = db.add_query(
+            SearchQuery(research_question_id=qid, query="original archive search")
+        )
+        db.mark_query_executed(reviewed_query)
+        avenue_id = db.rows("SELECT avenue FROM queries WHERE id=?", (reviewed_query,))[0][0]
+        run_id = db.start_run(ResearchRun(research_question_id=qid, model="model", provider="test"))
+        proposals = [
+            SearchQuery(
+                research_question_id=qid,
+                query=text,
+                rationale=text + " rationale",
+                gap="Missing research evidence",
+                novelty="Untried search",
+                source_target=target,
+                target_purpose=purpose,
+            )
+            for text, target, purpose in [
+                ("Spotify archive search", "spotify-naming", "source"),
+                ("Spotify metadata dating", "spotify-naming", "dating"),
+                ("Pitchfork snapshot dating", "pc-music-2014", "dating"),
+                ("Unknown source search", "missing-target", "source"),
+            ]
+        ]
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                db, "_retire_avenue_tx", lambda *args: (_ for _ in ()).throw(RuntimeError("crash"))
+            )
+            with pytest.raises(RuntimeError, match="crash"):
+                db.persist_review(
+                    run_id, qid, reviewed_query, "{}", proposals, [(avenue_id, "No evidence found")]
+                )
+        assert not db.rows("SELECT id FROM reviews")
+        assert not db.rows("SELECT id FROM review_query_rejections")
+        assert db.review_due(qid) == reviewed_query
+        assert not db.rows("SELECT avenue FROM exhausted_avenues")
+
+    with Database(path) as db:
+        assert db.review_due(qid) == reviewed_query
+        db.persist_review(
+            run_id, qid, reviewed_query, "{}", proposals, [(avenue_id, "No evidence found")]
+        )
+        assert db.review_due(qid) is None
+        assert len(db.rows("SELECT id FROM reviews WHERE run_id=?", (run_id,))) == 1
+        assert len(db.rows("SELECT id FROM review_query_rejections")) == 2
+        assert len(db.rows("SELECT id FROM queries WHERE query=?", (proposals[0].query,))) == 1
+        assert len(db.rows("SELECT id FROM queries WHERE query=?", (proposals[2].query,))) == 1
+        assert not db.rows("SELECT id FROM queries WHERE query=?", (proposals[1].query,))
+        assert (
+            len(db.rows("SELECT avenue FROM exhausted_avenues WHERE avenue=?", (avenue_id,))) == 1
+        )
+        with pytest.raises(ValueError, match="already reviewed"):
+            db.persist_review(run_id, qid, reviewed_query, "{}", proposals)
+        assert len(db.rows("SELECT id FROM reviews WHERE run_id=?", (run_id,))) == 1
+
+
+def test_review_conflicting_query_target_is_rejected_without_rebinding(tmp_path):
+    with Database(tmp_path / "db.sqlite") as db:
+        qid = db.add_question(ResearchQuestion(question="Where did hyperpop originate?"))
+        db.install_source_targets(
+            qid,
+            [("spotify-naming", "Spotify naming"), ("pc-music-2014", "Pitchfork article")],
+            [],
+        )
+        original = db.add_query(
+            SearchQuery(
+                research_question_id=qid, query="shared text", source_target="spotify-naming"
+            )
+        )
+        db.mark_query_executed(original)
+        run_id = db.start_run(ResearchRun(research_question_id=qid, model="model", provider="test"))
+        proposal = SearchQuery(
+            research_question_id=qid,
+            query="shared text",
+            rationale="Review assigned another target",
+            gap="Second source missing",
+            novelty="New target",
+            source_target="pc-music-2014",
+        )
+        db.persist_review(run_id, qid, original, "{}", [proposal])
+        assert db.review_due(qid) is None
+        assert len(db.rows("SELECT id FROM queries WHERE query='shared text'")) == 1
+        assert (
+            db.rows(
+                "SELECT t.key FROM queries q JOIN source_targets t ON t.id=q.source_target_id "
+                "WHERE q.id=?",
+                (original,),
+            )[0][0]
+            == "spotify-naming"
+        )
+        assert db.rows("SELECT reason FROM review_query_rejections")[0][0] == (
+            "Query already belongs to another source target"
+        )
+
+
 def test_unverified_transmission_and_status_remain_provisional(tmp_path):
     with Database(tmp_path / "db.sqlite") as db:
         qid = db.add_question(ResearchQuestion(question="Did modern hyperpop borrow a name?"))
