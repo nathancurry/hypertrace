@@ -80,7 +80,7 @@ def test_persistence_provenance_and_revision_integrity(tmp_path):
                     source_id=first_id,
                     research_question_id=q1,
                     exact_quote="names the style hyperpop",
-                    normalized_claim="The page uses hyperpop.",
+                    normalized_claim="names the style hyperpop",
                     evidence_type="observed_usage",
                     discovered_by_query_id=wrong_query,
                 )
@@ -90,11 +90,21 @@ def test_persistence_provenance_and_revision_integrity(tmp_path):
                 source_id=first_id,
                 research_question_id=q1,
                 exact_quote="names the style hyperpop",
-                normalized_claim="The page uses hyperpop.",
+                normalized_claim="names the style hyperpop",
                 evidence_type="observed_usage",
                 discovered_by_query_id=query,
             )
         )
+        with pytest.raises(ValueError, match="Normalized claim"):
+            db.add_evidence(
+                Evidence(
+                    source_id=first_id,
+                    research_question_id=q1,
+                    exact_quote="names the style hyperpop",
+                    normalized_claim="This was the first use of hyperpop.",
+                    evidence_type="observed_usage",
+                )
+            )
         with pytest.raises(ValueError, match="same research question"):
             db.add_relationship(evidence_id, h2, "supports", "Cross-question link")
         with pytest.raises(ValueError, match="cannot promote"):
@@ -553,7 +563,7 @@ def test_page_date_regions_context_and_retrieved_citation(tmp_path):
         assert "[Hyperpop pioneer](https://example.org/retrieved)" in report
         assert "[Hyperpop pioneer](https://example.org/other)" not in report
         assert "Context:" in report
-        undated = report.split("## Undated observations and excerpts", 1)[1].split(
+        undated = report.split("## Evidence outside verified chronology", 1)[1].split(
             "## Evidence in relation", 1
         )[0]
         assert undated.count("- E") == 1
@@ -578,16 +588,140 @@ def test_verified_chronology_ignores_conflicting_page_dates(tmp_path):
                     evidence_type="observed_usage",
                     quote_verified_date=verified_date,
                     date_verification_note="Manually checked dated print issue.",
+                    primary_source_verified=True,
                 )
             )
         chronology = (
             markdown_report(db, qid)
             .split("## Verified chronology", 1)[1]
-            .split("## Undated observations", 1)[0]
+            .split("## Evidence outside verified chronology", 1)[0]
         )
         assert chronology.index("1995-01-01") < chronology.index("2005-01-01")
         assert "2020-01-01" not in chronology
         assert "1990-01-01" not in chronology
+
+
+@pytest.mark.parametrize(
+    ("quote", "category", "has_lead"),
+    [
+        (
+            'The term "hyperpop" first appeared in print in October 1988, when Don Shewey used it.',
+            "attributed_origin_claim",
+            True,
+        ),
+        (
+            "Philip Sherburne was describing PC Music as hyper-pop in Pitchfork as early as 2014.",
+            "attributed_usage",
+            True,
+        ),
+        (
+            "Glenn McDonald coined the term hyperpop for the playlist in 2019.",
+            "attributed_origin_claim",
+            True,
+        ),
+        (
+            "Björk intended Hyperballad as an exaggeration of emotion.",
+            "attributed_intent",
+            False,
+        ),
+    ],
+)
+def test_secondary_claims_keep_attribution_and_source_leads(tmp_path, quote, category, has_lead):
+    path = tmp_path / "research.db"
+    with Database(path) as db:
+        qid = db.add_question(ResearchQuestion(question="Who first used hyperpop?"))
+        sid = db.add_source(_source("https://example.org/later-article", quote))
+        eid = db.add_evidence(
+            Evidence(
+                source_id=sid,
+                research_question_id=qid,
+                exact_quote=quote,
+                normalized_claim=quote,
+                evidence_type="observed_usage",
+            )
+        )
+        assert db.rows("SELECT evidence_type FROM evidence WHERE id=?", (eid,))[0][0] == category
+        assert bool(db.rows("SELECT id FROM leads WHERE source_id=?", (sid,))) == has_lead
+        # Reopening also corrects older rows in place without changing their identity.
+        db.conn.execute("UPDATE evidence SET evidence_type='observed_usage' WHERE id=?", (eid,))
+        db.conn.commit()
+    with Database(path) as db:
+        row = db.rows("SELECT id,source_id,evidence_type FROM evidence WHERE id=?", (eid,))[0]
+        assert (row["id"], row["source_id"], row["evidence_type"]) == (eid, sid, category)
+
+
+def test_direct_dated_usage_only_enters_verified_chronology(tmp_path):
+    with Database(tmp_path / "research.db") as db:
+        qid = db.add_question(ResearchQuestion(question="When was hyperpop directly used?"))
+        secondary = 'The term "hyperpop" first appeared in print in October 1988.'
+        direct = "The hyperpop scene is growing."
+        for url, quote, verified_date, primary in (
+            ("https://example.org/2021-history", secondary, "2021-05-01", False),
+            ("https://example.org/2014-article", direct, "2014-06-01", True),
+        ):
+            sid = db.add_source(_source(url, quote))
+            db.add_evidence(
+                Evidence(
+                    source_id=sid,
+                    research_question_id=qid,
+                    exact_quote=quote,
+                    normalized_claim=quote,
+                    evidence_type="observed_usage",
+                    quote_verified_date=verified_date,
+                    date_verification_note="Checked the dated source artifact.",
+                    primary_source_verified=primary,
+                )
+            )
+        report = markdown_report(db, qid)
+        chronology = report.split("## Verified chronology", 1)[1].split(
+            "## Evidence outside verified chronology", 1
+        )[0]
+        assert direct in chronology
+        assert secondary not in chronology
+        assert "1988" not in chronology
+        assert "2014-06-01" in chronology
+        assert "### Origin and coinage claims" in report
+        assert secondary in report
+
+
+def test_assessment_preserves_reported_usage_without_promoting_model_claim(tmp_path):
+    quote = "Philip Sherburne was describing PC Music as hyper-pop in Pitchfork as early as 2014."
+
+    class SecondaryLLM(WindowLLM):
+        async def complete(self, model, system, user, schema):
+            if schema is PageAssessment:
+                return LLMResult(
+                    value=PageAssessment.model_validate(
+                        {
+                            "relevant": True,
+                            "reason": "historical lead",
+                            "evidence": [
+                                {
+                                    "exact_quote": quote,
+                                    "normalized_claim": "Sherburne directly used hyper-pop in 2014.",
+                                    "evidence_type": "observed_usage",
+                                }
+                            ],
+                        }
+                    ),
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+            return await super().complete(model, system, user, schema)
+
+    config = _config(tmp_path)
+    with Database(config.db_path) as db:
+        source = _source("https://example.org/later-article", quote)
+        qid, _ = _assess_stored_page(db, config, source, SecondaryLLM())
+        row = db.rows(
+            "SELECT evidence_type,normalized_claim,quote_verified_date,source_id FROM evidence "
+            "WHERE research_question_id=?",
+            (qid,),
+        )[0]
+        assert tuple(row)[:3] == ("attributed_usage", quote, None)
+        assert db.rows(
+            "SELECT id FROM leads WHERE kind='citation' AND source_id=?", (row["source_id"],)
+        )
 
 
 def test_search_aggregator_snippet_is_only_a_lead(tmp_path):

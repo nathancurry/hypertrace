@@ -71,7 +71,15 @@ contiguous excerpt of at most 1200 characters. Do not infer influence from chron
 Classify what the term denotes in the quote; an earlier use of the string is not the origin
 of the modern genre term. Page publication metadata never dates the quoted text.
 Titles, tags, navigation, related content, and snippets are leads, not historical usages.
-OBSERVED_USAGE means directly visible term usage. CHRONOLOGICAL_PRECEDENCE only orders independently dated uses.
+OBSERVED_USAGE means the stored historical source itself uses the term in the context being
+recorded. A later source reporting an earlier use is ATTRIBUTED_USAGE, even if it quotes the
+term. Claims about first use, coinage, origin, derivation, or influence are
+ATTRIBUTED_ORIGIN_CLAIM unless direct primary evidence is verified. Statements about an
+artist's intent are ATTRIBUTED_INTENT unless directly verified from that artist.
+Analysis of meaning or similarity is INTERPRETIVE_CONTEXT. Preserve secondary claims and
+identify the original article, interview, playlist, or other artifact as a lead.
+Never turn the historical date named by a later source into a verified quote date.
+Never make normalized_claim stronger than exact_quote. CHRONOLOGICAL_PRECEDENCE only orders independently dated uses.
 CULTURAL_PROXIMITY records overlap. POSSIBLE_TRANSMISSION requires a plausible path.
 ATTRIBUTED_TRANSMISSION means a source claims influence. DEMONSTRATED_TRANSMISSION requires direct
 primary evidence of naming or borrowing. Do not call page metadata contemporary proof. When

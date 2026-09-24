@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Self
 
 from hypertrace.models import (
+    EpistemicType,
     Evidence,
     Hypothesis,
     QuoteRegion,
@@ -130,6 +131,38 @@ CREATE INDEX IF NOT EXISTS idx_candidates_pending ON candidates(assessed_at);
 """
 
 
+_ORIGIN_WORDS = re.compile(
+    r"\b(first|earliest|coined|originated|origin(?: point)?|derived from|influenced by|"
+    r"credited as|pivotal moment)\b|\b(?:was|were) created in response to\b",
+    re.IGNORECASE,
+)
+_INTENT_WORDS = re.compile(r"\b(?:intended|intent|meant to|wanted to)\b", re.IGNORECASE)
+_INTERPRETIVE_WORDS = re.compile(
+    r"\b(?:bore little resemblance|fuses|signif(?:y|ies)|evoking|reflects)\b",
+    re.IGNORECASE,
+)
+_REPORTED_USE = re.compile(
+    r"\b(?:was|were|had been)\s+(?:describing|using|used|calling|called)\b|"
+    r"\b(?:used|described|called)\b.{0,100}\b(?:as early as|in (?:19|20)\d{2})\b|"
+    r"\bas early as (?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+
+
+def _correct_evidence_type(quote: str, proposed: str) -> str:
+    if proposed != EpistemicType.OBSERVED_USAGE:
+        return proposed
+    if _INTENT_WORDS.search(quote):
+        return EpistemicType.ATTRIBUTED_INTENT
+    if _ORIGIN_WORDS.search(quote):
+        return EpistemicType.ATTRIBUTED_ORIGIN_CLAIM
+    if _INTERPRETIVE_WORDS.search(quote):
+        return EpistemicType.INTERPRETIVE_CONTEXT
+    if _REPORTED_USE.search(quote):
+        return EpistemicType.ATTRIBUTED_USAGE
+    return proposed
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
@@ -190,6 +223,23 @@ class Database:
                     "rationale='Legacy model status requires renewed verification.' "
                     "WHERE status!='open'"
                 )
+            for row in self.conn.execute(
+                "SELECT id,source_id,research_question_id,exact_quote,evidence_type "
+                "FROM evidence WHERE evidence_type='observed_usage'"
+            ).fetchall():
+                corrected = _correct_evidence_type(row["exact_quote"], row["evidence_type"])
+                if corrected == row["evidence_type"]:
+                    continue
+                self.conn.execute(
+                    "UPDATE evidence SET evidence_type=? WHERE id=?", (corrected, row["id"])
+                )
+                if corrected in {
+                    EpistemicType.ATTRIBUTED_USAGE,
+                    EpistemicType.ATTRIBUTED_ORIGIN_CLAIM,
+                }:
+                    self._add_attribution_lead_tx(
+                        row["research_question_id"], row["source_id"], row["exact_quote"]
+                    )
 
     def close(self) -> None:
         self.conn.close()
@@ -442,8 +492,24 @@ class Database:
             raise ValueError("Evidence quote must occur verbatim in the stored source text")
         if source["source_type"] == "search_aggregator":
             raise ValueError("Aggregator snippets cannot be evidence")
+        corrected_type = _correct_evidence_type(evidence.exact_quote, evidence.evidence_type.value)
+        if corrected_type != evidence.evidence_type.value:
+            evidence = evidence.model_copy(update={"evidence_type": EpistemicType(corrected_type)})
         quote_end = quote_start + len(evidence.exact_quote)
         region = self.quote_region(evidence.source_id, evidence.exact_quote)
+        if (
+            evidence.evidence_type.value
+            in {
+                "observed_usage",
+                "attributed_usage",
+                "attributed_origin_claim",
+                "attributed_intent",
+                "chronological_precedence",
+            }
+            and region != QuoteRegion.ARTICLE_BODY
+            and evidence.quote_verified_date is None
+        ):
+            raise ValueError("Historical usage requires article-body or verified contemporary text")
         if evidence.quote_verified_date is not None:
             try:
                 verified_date = date.fromisoformat(evidence.quote_verified_date)
@@ -453,12 +519,6 @@ class Database:
                 raise ValueError("Verified quote dates must use YYYY-MM-DD")
             if not evidence.date_verification_note.strip():
                 raise ValueError("Verified quote dates require an independent verification note")
-        if (
-            evidence.evidence_type.value in {"observed_usage", "chronological_precedence"}
-            and region != QuoteRegion.ARTICLE_BODY
-            and evidence.quote_verified_date is None
-        ):
-            raise ValueError("Historical usage requires article-body or verified contemporary text")
         if (
             evidence.evidence_type.value == "chronological_precedence"
             and not evidence.quote_verified_date
@@ -482,6 +542,8 @@ class Database:
             ).fetchone()
             if query is None or query["research_question_id"] != evidence.research_question_id:
                 raise ValueError("Discovery query must belong to the evidence question")
+        if evidence.normalized_claim != evidence.exact_quote:
+            raise ValueError("Normalized claim must match the exact excerpt")
         values = evidence.model_dump(exclude={"id"}, mode="json")
         values["quote_start"] = quote_start
         values["quote_region"] = region.value
@@ -504,7 +566,25 @@ class Database:
                 evidence.normalized_claim,
             ),
         ).fetchone()
+        if evidence.evidence_type in {
+            EpistemicType.ATTRIBUTED_USAGE,
+            EpistemicType.ATTRIBUTED_ORIGIN_CLAIM,
+        }:
+            self._add_attribution_lead_tx(
+                evidence.research_question_id, evidence.source_id, evidence.exact_quote
+            )
         return int(row["id"])
+
+    def _add_attribution_lead_tx(self, question_id: int, source_id: int, quote: str) -> None:
+        self._add_lead_tx(
+            ResearchLead(
+                research_question_id=question_id,
+                source_id=source_id,
+                kind="citation",
+                value=quote[:500],
+                rationale="Find the historical source or artifact identified here and verify its text and date.",
+            )
+        )
 
     def add_lead(self, lead: ResearchLead) -> int:
         with self.conn:

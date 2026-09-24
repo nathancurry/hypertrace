@@ -149,6 +149,9 @@ def markdown_report(db: Database, question_id: int) -> str:
         lines.append("No hypotheses recorded.")
     if suggestions:
         lines.extend(["", "## Provisional model status suggestions", ""])
+        lines.append(
+            "These unaccepted model rationales may describe secondary attribution as direct usage; check the evidence categories below."
+        )
         for suggestion in suggestions:
             lines.append(
                 f"- H{suggestion['hypothesis_id']} → {suggestion['proposed_status']} "
@@ -156,9 +159,15 @@ def markdown_report(db: Database, question_id: int) -> str:
                 f"{_cell(suggestion['rationale'])}"
             )
     lines.extend(["", "## Verified chronology", ""])
-    dated = [e for e in displayed if e["quote_verified_date"]]
+    dated = [
+        e
+        for e in displayed
+        if e["evidence_type"] == "observed_usage"
+        and e["quote_verified_date"]
+        and e["primary_source_verified"]
+    ]
     if not dated:
-        lines.append("No independently dated quote is recorded.")
+        lines.append("No independently dated quote of directly observed usage is recorded.")
     lines.extend(
         [
             "",
@@ -174,18 +183,44 @@ def markdown_report(db: Database, question_id: int) -> str:
             f"G{group_by_source[e['source_id']]} (independence unresolved) | "
             f"{_cite(e['retrieved_url'], e['title'], e['source_id'])} |"
         )
-    lines.extend(["", "## Undated observations and excerpts", ""])
-    undated = [e for e in displayed if not e["quote_verified_date"]]
-    if not undated:
-        lines.append("None recorded.")
+    lines.extend(["", "## Evidence outside verified chronology", ""])
+    undated = [e for e in displayed if e not in dated]
+    sections = (
+        ("Other directly observed historical usage", "observed_usage"),
+        ("Later attribution of historical usage", "attributed_usage"),
+        ("Origin and coinage claims", "attributed_origin_claim"),
+        ("Attributed intent", "attributed_intent"),
+        ("Interpretive commentary", "interpretive_context"),
+    )
+    shown: set[int] = set()
+    for heading, category in sections:
+        rows = [e for e in undated if e["evidence_type"] == category]
+        if not rows and category != "observed_usage":
+            continue
+        lines.extend(["", f"### {heading}", ""])
+        if not rows:
+            lines.append("No additional direct usage outside the verified chronology.")
+            continue
+        for e in rows:
+            shown.add(e["id"])
+            verified_date = (
+                f" Independently verified date of this excerpt: {e['quote_verified_date']}."
+                if e["quote_verified_date"]
+                else ""
+            )
+            lines.append(
+                f"- E{e['id']} [G{group_by_source[e['source_id']]}; {e['evidence_type']}; "
+                f"{e['term_sense']}; {e['quote_region']}]: “{_cell(e['exact_quote'])}” "
+                f"{_cite(e['retrieved_url'], e['title'], e['source_id'])}. "
+                f"Page publication metadata: {_cell(e['page_publication_date'])} (unverified for this quote)."
+                f"{verified_date} Context: “{_cell(e['quote_context'])}”"
+            )
     for e in undated:
-        lines.append(
-            f"- E{e['id']} [G{group_by_source[e['source_id']]}; {e['evidence_type']}; "
-            f"{e['term_sense']}; {e['quote_region']}]: “{_cell(e['exact_quote'])}” "
-            f"{_cite(e['retrieved_url'], e['title'], e['source_id'])}. "
-            f"Page publication metadata: {_cell(e['page_publication_date'])} (unverified for this quote). "
-            f"Context: “{_cell(e['quote_context'])}”"
-        )
+        if e["id"] not in shown:
+            lines.append(
+                f"- E{e['id']} [{e['evidence_type']}]: “{_cell(e['exact_quote'])}” "
+                f"{_cite(e['retrieved_url'], e['title'], e['source_id'])}."
+            )
     if source_captures:
         lines.extend(["", "## Source captures and independence", ""])
         groups: dict[int, list] = {}

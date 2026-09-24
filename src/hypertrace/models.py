@@ -27,6 +27,10 @@ class HypothesisStatus(StrEnum):
 
 class EpistemicType(StrEnum):
     OBSERVED_USAGE = "observed_usage"
+    ATTRIBUTED_USAGE = "attributed_usage"
+    ATTRIBUTED_ORIGIN_CLAIM = "attributed_origin_claim"
+    ATTRIBUTED_INTENT = "attributed_intent"
+    INTERPRETIVE_CONTEXT = "interpretive_context"
     CHRONOLOGICAL_PRECEDENCE = "chronological_precedence"
     CULTURAL_PROXIMITY = "cultural_proximity"
     POSSIBLE_TRANSMISSION = "possible_transmission"

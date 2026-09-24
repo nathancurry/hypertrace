@@ -550,7 +550,14 @@ class Researcher:
                     source.source_type == "search_aggregator"
                     or region != QuoteRegion.ARTICLE_BODY
                     or item_evidence.evidence_type.value
-                    not in {"observed_usage", "cultural_proximity"}
+                    not in {
+                        "observed_usage",
+                        "attributed_usage",
+                        "attributed_origin_claim",
+                        "attributed_intent",
+                        "interpretive_context",
+                        "cultural_proximity",
+                    }
                 ):
                     target = self.db.quote_target(source_id, item_evidence.exact_quote)
                     lead_records.append(
@@ -580,8 +587,7 @@ class Researcher:
                             contemporaneous=None,
                             confidence=item_evidence.confidence,
                             interpretation_notes=(
-                                "Unverified model claim: "
-                                f"{item_evidence.normalized_claim}. "
+                                "Model interpretation, not verified source evidence: "
                                 f"{item_evidence.interpretation_notes}"
                             ),
                             term_sense=item_evidence.term_sense,
