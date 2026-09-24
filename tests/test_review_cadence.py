@@ -107,6 +107,7 @@ def _evidence(db, question_id, query_id, *, primary):
             content_hash=hashlib.sha256(content.encode()).hexdigest(),
         )
     )
+    target_id = db.rows("SELECT source_target_id FROM queries WHERE id=?", (query_id,))[0][0]
     return db.add_evidence(
         Evidence(
             source_id=source_id,
@@ -116,6 +117,8 @@ def _evidence(db, question_id, query_id, *, primary):
             evidence_type="observed_usage" if primary else "interpretive_context",
             primary_source_verified=primary,
             discovered_by_query_id=query_id,
+            verified_target_id=target_id if primary else None,
+            target_verification_note="Verified target source text" if primary and target_id else "",
         )
     )
 
@@ -126,6 +129,10 @@ def test_one_search_waits_but_threshold_reviews(tmp_path):
         reviewer = Reviewer()
         runner = _runner(db, _config(tmp_path, threshold=3), question_id, reviewer)
         _prime_review(runner)
+        assert db.rows("SELECT actions_taken FROM runs WHERE id=?", (runner.run_id,))[0][0] == 1
+        assert runner.actions == 1
+        assert not db.rows("SELECT id FROM actions WHERE action='review_context'")
+        assert db.rows("SELECT id FROM context_diagnostics WHERE logical_action='review'")
         _next_query(db, question_id)
         db.record_action(runner.run_id, "search", "query_id=2 results=0")
         assert not asyncio.run(runner._maybe_review())

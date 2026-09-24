@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import math
+import os
 import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -45,8 +50,28 @@ class BudgetStop(Exception):
     pass
 
 
+def _search_retry_delay(exc: Exception, attempt: int) -> float:
+    if isinstance(exc, httpx.HTTPStatusError):
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                seconds = float(retry_after)
+                if math.isfinite(seconds):
+                    return max(0.0, seconds)
+            except ValueError:
+                try:
+                    return max(
+                        0.0,
+                        (parsedate_to_datetime(retry_after) - datetime.now(UTC)).total_seconds(),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return min(120.0, 15.0 * 2 ** (attempt - 1))
+
+
 ASSESSMENT_LIMIT = 16_000
 REVIEW_CONTEXT_LIMIT = 24_000  # About 6,000 tokens at the provider's four-character estimate.
+RESEARCH_CONTEXT_LIMIT = 24_000
 WINDOW_CONTEXT = 400
 SEARCH_STOPWORDS = {
     "about",
@@ -453,7 +478,7 @@ class Researcher:
             raise BudgetStop("missing_usage_for_cost_limit")
         return result.value
 
-    def _context(self) -> dict:
+    def _context(self, query_id: int | None = None) -> tuple[dict, dict]:
         q = self.db.rows("SELECT * FROM questions WHERE id=?", (self.question_id,))
         if not q:
             raise ValueError(f"Unknown question ID {self.question_id}")
@@ -465,26 +490,90 @@ class Researcher:
                 (self.question_id,),
             )
         ]
-        evidence = [
-            dict(row)
-            for row in self.db.rows(
-                "SELECT e.id,e.exact_quote,e.normalized_claim,e.evidence_type,e.confidence,"
-                "e.quote_verified_date,e.quote_region,e.quote_context,e.term_sense,"
-                "s.retrieved_url,s.page_publication_date,s.dating_notes FROM evidence e "
-                "JOIN sources s ON s.id=e.source_id WHERE e.research_question_id=? "
-                "ORDER BY e.id DESC",
-                (self.question_id,),
+        target_id = None
+        if query_id is not None:
+            query = self.db.rows(
+                "SELECT source_target_id FROM queries WHERE id=? AND research_question_id=?",
+                (query_id, self.question_id),
             )
-        ]
-        relationships = [
-            dict(row)
-            for row in self.db.rows(
-                "SELECT r.evidence_id,r.hypothesis_id,r.kind,r.rationale FROM relationships r "
-                "JOIN evidence e ON e.id=r.evidence_id WHERE e.research_question_id=? "
-                "ORDER BY r.id DESC",
-                (self.question_id,),
+            target_id = query[0]["source_target_id"] if query else None
+        selected_ids: dict[int, None] = {}
+
+        def include_ids(sql: str, params: tuple) -> None:
+            for row in self.db.rows(sql, params):
+                selected_ids.setdefault(row[0], None)
+
+        if query_id is not None:
+            include_ids(
+                "SELECT id FROM evidence WHERE research_question_id=? "
+                "AND discovered_by_query_id=? ORDER BY id DESC LIMIT 6",
+                (self.question_id, query_id),
             )
-        ]
+        include_ids(
+            "SELECT e.id FROM evidence e JOIN relationships r ON r.evidence_id=e.id "
+            "JOIN hypotheses h ON h.id=r.hypothesis_id "
+            "WHERE e.research_question_id=? AND r.kind='contradicts' "
+            "AND h.archived_at IS NULL ORDER BY e.id DESC LIMIT 6",
+            (self.question_id,),
+        )
+        if target_id is not None:
+            include_ids(
+                "SELECT e.id FROM evidence e LEFT JOIN queries q "
+                "ON q.id=e.discovered_by_query_id WHERE e.research_question_id=? "
+                "AND (e.verified_target_id=? OR q.source_target_id=?) "
+                "ORDER BY e.id DESC LIMIT 6",
+                (self.question_id, target_id, target_id),
+            )
+        include_ids(
+            "SELECT id FROM evidence WHERE research_question_id=? "
+            "AND (primary_source_verified=1 OR evidence_type IN "
+            "('observed_usage','demonstrated_transmission')) "
+            "ORDER BY id DESC LIMIT 6",
+            (self.question_id,),
+        )
+        include_ids(
+            "SELECT id FROM evidence WHERE research_question_id=? ORDER BY id DESC LIMIT 6",
+            (self.question_id,),
+        )
+        evidence = []
+        relationships = []
+        if selected_ids:
+            placeholders = ",".join("?" for _ in selected_ids)
+            found = {
+                row["id"]: dict(row)
+                for row in self.db.rows(
+                    "SELECT e.id,e.exact_quote,e.evidence_type,e.confidence,"
+                    "e.quote_verified_date,e.quote_region,e.quote_context,e.term_sense,"
+                    "e.primary_source_verified,s.retrieved_url,s.page_publication_date,"
+                    "s.dating_notes FROM evidence e JOIN sources s ON s.id=e.source_id "
+                    f"WHERE e.id IN ({placeholders})",
+                    tuple(selected_ids),
+                )
+            }
+            for evidence_id in selected_ids:
+                item = found[evidence_id]
+                quote = item.pop("exact_quote")
+                item["quote_excerpt"] = quote[:700]
+                item["quote_truncated"] = len(quote) > 700
+                for key, limit in (
+                    ("quote_context", 400),
+                    ("retrieved_url", 250),
+                    ("dating_notes", 150),
+                ):
+                    item[key] = (item[key] or "")[:limit]
+                evidence.append(item)
+            relationships = [
+                dict(row)
+                for row in self.db.rows(
+                    "SELECT r.evidence_id,r.hypothesis_id,r.kind,r.rationale "
+                    "FROM relationships r JOIN hypotheses h ON h.id=r.hypothesis_id "
+                    f"WHERE r.evidence_id IN ({placeholders}) AND h.archived_at IS NULL "
+                    "ORDER BY r.id DESC",
+                    tuple(selected_ids),
+                )
+            ][:48]
+            for item in relationships:
+                item["rationale"] = item["rationale"][:180]
         pending = [
             dict(row)
             for row in self.db.rows(
@@ -514,15 +603,74 @@ class Researcher:
                 (self.question_id,),
             )
         ]
-        failed_sources = [
+        failed_sources = []
+        if target_id is not None:
+            failed_sources.extend(
+                dict(row)
+                for row in self.db.rows(
+                    "SELECT c.id,c.url,c.fetch_error,c.failure_at FROM candidates c "
+                    "JOIN queries q ON q.id=c.query_id WHERE q.research_question_id=? "
+                    "AND q.source_target_id=? AND c.fetch_error IS NOT NULL "
+                    "ORDER BY c.id DESC LIMIT 10",
+                    (self.question_id, target_id),
+                )
+            )
+        failed_sources.extend(
             dict(row)
             for row in self.db.rows(
-                "SELECT c.url,c.fetch_error,c.failure_at FROM candidates c "
-                "JOIN queries q ON q.id=c.query_id "
-                "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL",
+                "SELECT c.id,c.url,c.fetch_error,c.failure_at FROM candidates c "
+                "JOIN queries q ON q.id=c.query_id WHERE q.research_question_id=? "
+                "AND c.fetch_error IS NOT NULL ORDER BY c.id DESC LIMIT 15",
                 (self.question_id,),
             )
-        ]
+        )
+        failed_sources = list({item["id"]: item for item in failed_sources}.values())[:20]
+        for item in failed_sources:
+            item["url"] = item["url"][:250]
+            item["fetch_error"] = item["fetch_error"][:200]
+        gaps: list[dict] = []
+        if target_id is not None:
+            gaps.extend(
+                dict(row)
+                for row in self.db.rows(
+                    "SELECT 'archive:' || a.id gap_id,a.original_url,a.detail,a.status "
+                    "FROM archive_lookups a JOIN queries q ON q.id=a.query_id "
+                    "WHERE a.research_question_id=? AND q.source_target_id=? "
+                    "AND a.status IN ('gap','retryable') ORDER BY a.id DESC LIMIT 6",
+                    (self.question_id, target_id),
+                )
+            )
+            gaps.extend(
+                dict(row)
+                for row in self.db.rows(
+                    "SELECT 'search:' || id gap_id,query original_url,search_error detail,"
+                    "status FROM queries WHERE research_question_id=? AND source_target_id=? "
+                    "AND search_error IS NOT NULL ORDER BY id DESC LIMIT 6",
+                    (self.question_id, target_id),
+                )
+            )
+        gaps.extend(
+            dict(row)
+            for row in self.db.rows(
+                "SELECT 'archive:' || id gap_id,original_url,detail,status "
+                "FROM archive_lookups WHERE research_question_id=? "
+                "AND status IN ('gap','retryable') ORDER BY id DESC LIMIT 8",
+                (self.question_id,),
+            )
+        )
+        gaps.extend(
+            dict(row)
+            for row in self.db.rows(
+                "SELECT 'search:' || id gap_id,query original_url,search_error detail,"
+                "status FROM queries WHERE research_question_id=? "
+                "AND search_error IS NOT NULL ORDER BY id DESC LIMIT 8",
+                (self.question_id,),
+            )
+        )
+        gaps = list({item["gap_id"]: item for item in gaps}.values())[:16]
+        for item in gaps:
+            item["original_url"] = item["original_url"][:250]
+            item["detail"] = item["detail"][:200]
         avenues = [
             dict(row)
             for row in self.db.rows(
@@ -533,7 +681,7 @@ class Researcher:
                 (self.question_id,),
             )
         ]
-        return {
+        context = {
             "question": q[0]["question"],
             "hypotheses": hypotheses,
             "evidence": evidence,
@@ -542,8 +690,64 @@ class Researcher:
             "source_targets": source_targets,
             "leads": leads,
             "failed_sources": failed_sources,
+            "gaps": gaps,
             "avenues": avenues,
         }
+
+        def size() -> int:
+            return len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+
+        for key in ("avenues", "leads", "failed_sources", "gaps", "relationships", "evidence"):
+            while size() > RESEARCH_CONTEXT_LIMIT and context[key]:
+                context[key].pop()
+        included_evidence = {item["id"] for item in context["evidence"]}
+        context["relationships"] = [
+            item for item in context["relationships"] if item["evidence_id"] in included_evidence
+        ]
+        if size() > RESEARCH_CONTEXT_LIMIT:
+            raise ValueError("Mandatory research context exceeds character budget")
+        totals = {
+            "hypotheses": len(hypotheses),
+            "source_targets": len(source_targets),
+            "evidence": self.db.rows(
+                "SELECT COUNT(*) FROM evidence WHERE research_question_id=?", (self.question_id,)
+            )[0][0],
+            "relationships": self.db.rows(
+                "SELECT COUNT(*) FROM relationships r JOIN evidence e ON e.id=r.evidence_id "
+                "WHERE e.research_question_id=?",
+                (self.question_id,),
+            )[0][0],
+            "failed_sources": self.db.rows(
+                "SELECT COUNT(*) FROM candidates c JOIN queries q ON q.id=c.query_id "
+                "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL",
+                (self.question_id,),
+            )[0][0],
+            "gaps": self.db.rows(
+                "SELECT (SELECT COUNT(*) FROM archive_lookups WHERE research_question_id=? "
+                "AND status IN ('gap','retryable')) + "
+                "(SELECT COUNT(*) FROM queries WHERE research_question_id=? "
+                "AND search_error IS NOT NULL)",
+                (self.question_id, self.question_id),
+            )[0][0],
+            "pending_queries": self.db.rows(
+                "SELECT COUNT(*) FROM queries WHERE research_question_id=? "
+                "AND status='active' AND executed_at IS NULL",
+                (self.question_id,),
+            )[0][0],
+            "leads": self.db.rows(
+                "SELECT COUNT(*) FROM leads WHERE research_question_id=?", (self.question_id,)
+            )[0][0],
+            "avenues": self.db.rows(
+                "SELECT COUNT(DISTINCT avenue) FROM queries WHERE research_question_id=? "
+                "AND status IN ('active','deferred') AND avenue!=''",
+                (self.question_id,),
+            )[0][0],
+        }
+        counts = {
+            key: {"included": len(context[key]), "omitted": totals[key] - len(context[key])}
+            for key in totals
+        }
+        return context, counts
 
     def _review_context(self, query_id: int) -> tuple[dict, dict]:
         def short(value: str | None, limit: int = 300) -> str:
@@ -628,6 +832,10 @@ class Researcher:
                 item["id"],
             )
 
+        uncovered_ids = set(self.db.review_cadence_state(qid)["evidence_ids"])
+        for item in sorted(evidence, key=lambda item: item["id"]):
+            if item["id"] in uncovered_ids:
+                add(item)
         for item in evidence:
             if item["created_at"] > last_review_at:
                 add(item)
@@ -715,6 +923,8 @@ class Researcher:
                 context[key].pop()
         if size() > REVIEW_CONTEXT_LIMIT:
             raise ValueError("Mandatory review context exceeds character budget")
+        if uncovered_ids and not any(item["id"] in uncovered_ids for item in context["evidence"]):
+            raise ValueError("No unreviewed material evidence fits review context")
         counts = {
             "evidence": {
                 "included": len(context["evidence"]),
@@ -771,7 +981,8 @@ class Researcher:
         return context, counts
 
     async def _plan(self) -> None:
-        context = self._context()
+        context, counts = self._context()
+        self.db.record_context_diagnostics(self.run_id, "plan", None, context, counts)
         plan = await self._complete(
             "plan",
             self.config.router_model,
@@ -796,6 +1007,7 @@ class Researcher:
                 )
                 for item in plan.queries
             ],
+            self.run_id,
         )
 
     async def _search(self, query: dict) -> None:
@@ -805,17 +1017,38 @@ class Researcher:
                 self.retrieval.search(query["query"], count=5),
                 timeout=max(0.001, self.deadline - time.monotonic()),
             )
-        except TimeoutError as exc:
-            self._record("search", f"query_id={query['id']} timed out")
-            raise BudgetStop("max_minutes") from exc
-        except Exception as exc:
-            self._record("search", f"query_id={query['id']} failed: {type(exc).__name__}: {exc}")
-            raise
+        except (
+            TimeoutError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+            httpx.HTTPStatusError,
+        ) as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and not (
+                exc.response.status_code == 429 or 500 <= exc.response.status_code < 600
+            ):
+                raise
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            reason = f"HTTP {status}" if status is not None else type(exc).__name__
+            retryable = self.db.record_search_failure(
+                self.question_id,
+                query["id"],
+                reason,
+                _search_retry_delay(exc, query["search_attempts"] + 1),
+            )
+            self._record(
+                "search",
+                f"query_id={query['id']} failed: {reason}; "
+                f"{'retry scheduled' if retryable else 'retry limit reached'}",
+            )
+            if time.monotonic() >= self.deadline:
+                raise BudgetStop("max_minutes") from exc
+            return
         self._record("search", f"query_id={query['id']} results={len(results)}")
         self.db.persist_search_results(
             self.question_id,
             query["id"],
             [(item.url, item.title) for item in results[:5]],
+            self.run_id,
         )
 
     async def _archive_lookup(self, target: dict) -> None:
@@ -834,14 +1067,29 @@ class Researcher:
                 timeout=max(0.001, self.deadline - time.monotonic()),
             )
             detail = f"{len(snapshots)} useful snapshots"
+            retryable = False
         except ArchiveGap as exc:
             snapshots = []
             detail = str(exc)
+            retryable = exc.retryable
         except TimeoutError:
             snapshots = []
             detail = "CDX lookup timed out"
+            retryable = True
+        previous = self.db.rows(
+            "SELECT attempt_count FROM archive_lookups WHERE research_question_id=? "
+            "AND original_url=?",
+            (self.question_id, target["original_url"]),
+        )
+        attempt = previous[0]["attempt_count"] + 1 if previous else 1
         self.db.record_archive_lookup(
-            self.question_id, target["query_id"], target["original_url"], snapshots, detail
+            self.question_id,
+            target["query_id"],
+            target["original_url"],
+            snapshots,
+            detail,
+            retryable=retryable,
+            retry_delay_seconds=min(120, 30 * 2 ** (attempt - 1)),
         )
         self._record("archive_lookup", f"url={target['original_url']} {detail}")
 
@@ -931,7 +1179,7 @@ class Researcher:
                 final_url=source.retrieved_url,
             )
             return False
-        context = self._context()
+        context, _ = self._context(candidate["query_id"])
         mode = "full_document"
         source_text: dict = {"text": source.content}
         if len(source.content) > ASSESSMENT_LIMIT:
@@ -943,7 +1191,9 @@ class Researcher:
                 source, context["question"], context["hypotheses"], query[0]
             )
             if not windows:
-                self.db.persist_candidate_assessment(candidate["id"], [], [], [], mode)
+                self.db.persist_candidate_assessment(
+                    candidate["id"], [], [], [], mode, run_id=self.run_id
+                )
                 self._record("assess", f"source_id={source_id} mode={mode} no relevant body terms")
                 return True
             source_text = {"windows": windows}
@@ -1071,15 +1321,21 @@ class Researcher:
                     )
                 )
         added = self.db.persist_candidate_assessment(
-            candidate["id"], evidence_records, lead_records, query_records, mode
+            candidate["id"],
+            evidence_records,
+            lead_records,
+            query_records,
+            mode,
+            run_id=self.run_id,
         )
         self.evidence_added += added
         return True
 
-    async def _interpret(self) -> None:
-        context = self._context()
+    async def _interpret(self, query_id: int | None = None) -> None:
+        context, counts = self._context(query_id)
         if not context["evidence"]:
             return
+        self.db.record_context_diagnostics(self.run_id, "interpret", query_id, context, counts)
         interpretation: Interpretation = await self._complete(
             "interpret",
             self.model,
@@ -1141,17 +1397,7 @@ class Researcher:
         try:
             context, counts = self._review_context(query_id)
             prompt = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-            self.db.record_action(
-                self.run_id,
-                "review_context",
-                json.dumps(
-                    {
-                        "characters": len(prompt),
-                        "estimated_tokens": (len(prompt) + 3) // 4,
-                        "counts": counts,
-                    }
-                ),
-            )
+            self.db.record_context_diagnostics(self.run_id, "review", query_id, context, counts)
             review: AdversarialReview = await self._complete(
                 "review",
                 self.config.review_model,
@@ -1194,6 +1440,7 @@ class Researcher:
             ][: self.config.review_query_limit],
             [(item.avenue_id, item.reason) for item in review.exhausted_avenues],
             allow_repeat=allow_repeat,
+            included_evidence_ids=[item["id"] for item in context["evidence"]],
         )
 
     async def _maybe_review(self, *, final: bool = False) -> bool:
@@ -1248,35 +1495,81 @@ class Researcher:
     async def run(self) -> int:
         self.deadline = time.monotonic() + self.limits.max_minutes * 60
         self._context()  # Check question before creating a run.
-        self.run_id = self.db.start_run(
-            ResearchRun(
-                research_question_id=self.question_id,
-                model=self.model,
-                provider=self.config.llm_base_url,
-            )
+        database_path = self.db.path.resolve()
+        lock_path = database_path.with_name(
+            f"{database_path.name}.question-{self.question_id}.run.lock"
         )
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            self.db.requeue_retryable_fetches(self.question_id)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(lock_fd)
+            raise RuntimeError("A research run is already active for this question") from exc
+        try:
+            self.run_id = self.db.start_run(
+                ResearchRun(
+                    research_question_id=self.question_id,
+                    model=self.model,
+                    provider=self.config.llm_base_url,
+                )
+            )
+            self.db.reconcile_unfinished_runs(self.run_id)
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        try:
+            rechecked_due_retry = False
             while True:
                 self._check()
                 candidate = self.db.pending_candidate(self.question_id)
                 if candidate:
+                    rechecked_due_retry = False
                     before = self.evidence_added
                     distinct = await self._one_candidate(dict(candidate))
                     if distinct:
                         self.recent_yields.append(min(1, self.evidence_added - before))
                     if self.evidence_added > before:
-                        await self._interpret()
+                        await self._interpret(candidate["query_id"])
                     continue
+                self.db.finalize_target_searches(
+                    self.run_id, self.config.max_consecutive_target_searches
+                )
                 if await self._maybe_review():
+                    rechecked_due_retry = False
                     continue
                 archive_target = (
                     self.db.next_archive_lookup(self.question_id) if self.archive else None
                 )
                 if archive_target:
+                    rechecked_due_retry = False
                     await self._archive_lookup(archive_target)
                     continue
-                context = self._context()
+                query = self.db.next_search_query(
+                    self.question_id, self.run_id, self.config.max_consecutive_target_searches
+                )
+                if query is not None:
+                    rechecked_due_retry = False
+                    await self._search(dict(query))
+                    continue
+                retry_at = self.db.next_retry_at(
+                    self.question_id, include_archive=self.archive is not None
+                )
+                if retry_at is not None:
+                    delay = (retry_at - datetime.now(UTC)).total_seconds()
+                    remaining = self.deadline - time.monotonic()
+                    if delay >= remaining:
+                        raise BudgetStop("retry_beyond_deadline")
+                    if delay <= 0:
+                        if rechecked_due_retry:
+                            raise BudgetStop("retry_work_unavailable")
+                        rechecked_due_retry = True
+                        continue
+                    await asyncio.sleep(delay)
+                    rechecked_due_retry = False
+                    continue
+                if self.db.has_active_searches(self.question_id):
+                    raise BudgetStop("target_low_yield")
+                context, _ = self._context()
                 if (
                     len(self.recent_yields) == 3
                     and sum(self.recent_yields) / 3 < self.limits.min_yield
@@ -1285,12 +1578,19 @@ class Researcher:
                     raise BudgetStop("low_marginal_yield")
                 if not context["pending_queries"]:
                     await self._plan()
-                    context = self._context()
+                    context, _ = self._context()
                     if not context["pending_queries"]:
                         raise BudgetStop("no_new_queries")
-                query = context["pending_queries"][0]
-                await self._search(query)
+                query = self.db.next_search_query(
+                    self.question_id, self.run_id, self.config.max_consecutive_target_searches
+                )
+                if query is None:
+                    raise BudgetStop("target_low_yield")
+                await self._search(dict(query))
         except BudgetStop as exc:
+            self.db.finalize_target_searches(
+                self.run_id, self.config.max_consecutive_target_searches
+            )
             if str(exc) not in {"review_failed", "candidate_assessment_failed"}:
                 try:
                     await self._maybe_review(final=True)
@@ -1303,4 +1603,6 @@ class Researcher:
         except Exception as exc:
             self.db.finish_run(self.run_id, "failed", f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            os.close(lock_fd)
         return self.run_id

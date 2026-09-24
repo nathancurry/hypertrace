@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Self
 from urllib.parse import urlsplit
@@ -38,6 +38,10 @@ from hypertrace.models import (
 )
 from hypertrace.retrieval.wayback import Snapshot
 from hypertrace.retrieval.web import canonicalize_url
+
+ARCHIVE_MAX_ATTEMPTS = 3
+SEARCH_MAX_ATTEMPTS = 3
+FETCH_MAX_ATTEMPTS = 3
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -76,6 +80,8 @@ CREATE TABLE IF NOT EXISTS archive_lookups (
   id INTEGER PRIMARY KEY, research_question_id INTEGER NOT NULL REFERENCES questions(id),
   query_id INTEGER NOT NULL REFERENCES queries(id), original_url TEXT NOT NULL,
   status TEXT NOT NULL, detail TEXT NOT NULL, attempted_at TEXT NOT NULL,
+  retryable INTEGER NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 1,
+  next_eligible_at TEXT,
   UNIQUE(research_question_id,original_url)
 );
 CREATE TABLE IF NOT EXISTS queries (
@@ -89,6 +95,8 @@ CREATE TABLE IF NOT EXISTS queries (
   duplicate_of INTEGER REFERENCES queries(id),
   source_target_id INTEGER REFERENCES source_targets(id),
   target_purpose TEXT NOT NULL DEFAULT 'source',
+  search_error TEXT, search_attempts INTEGER NOT NULL DEFAULT 0,
+  search_next_eligible_at TEXT,
   UNIQUE(research_question_id, query)
 );
 CREATE TABLE IF NOT EXISTS exhausted_avenues (
@@ -113,9 +121,16 @@ CREATE TABLE IF NOT EXISTS candidates (
   assessed_at TEXT, fetch_error TEXT, failure_at TEXT, assessment_error TEXT,
   fetch_status INTEGER, fetch_final_url TEXT, fetch_redirects_json TEXT,
   fetch_retryable INTEGER CHECK(fetch_retryable IN (0,1)),
+  fetch_attempts INTEGER NOT NULL DEFAULT 0, fetch_next_eligible_at TEXT,
   original_url TEXT, resolved_original_url TEXT, archive_timestamp TEXT,
   assessment_mode TEXT CHECK(assessment_mode IN ('full_document','relevance_windows')),
   UNIQUE(query_id, url)
+);
+CREATE TABLE IF NOT EXISTS fetch_attempt_events (
+  id INTEGER PRIMARY KEY, candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+  attempt_number INTEGER NOT NULL, failed_at TEXT NOT NULL, reason TEXT NOT NULL,
+  status_code INTEGER, retryable INTEGER NOT NULL, next_eligible_at TEXT,
+  UNIQUE(candidate_id,attempt_number)
 );
 CREATE TABLE IF NOT EXISTS query_target_proposals (
   id INTEGER PRIMARY KEY,
@@ -127,9 +142,38 @@ CREATE TABLE IF NOT EXISTS query_target_proposals (
   reason TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL,
   UNIQUE(candidate_id,query_id,source_target_key,target_purpose)
 );
+CREATE TABLE IF NOT EXISTS query_target_associations (
+  id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES queries(id),
+  source_target_id INTEGER NOT NULL REFERENCES source_targets(id),
+  target_purpose TEXT NOT NULL, rationale TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(query_id,source_target_id,target_purpose)
+);
+CREATE TABLE IF NOT EXISTS plan_query_rejections (
+  id INTEGER PRIMARY KEY, run_id INTEGER REFERENCES runs(id),
+  research_question_id INTEGER NOT NULL REFERENCES questions(id),
+  query_text TEXT NOT NULL, generated_by TEXT NOT NULL,
+  rationale TEXT NOT NULL, gap TEXT NOT NULL,
+  novelty TEXT NOT NULL, source_target_key TEXT NOT NULL,
+  target_purpose TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(run_id,query_text,source_target_key,target_purpose)
+);
+CREATE TABLE IF NOT EXISTS target_search_progress (
+  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
+  query_id INTEGER NOT NULL UNIQUE REFERENCES queries(id),
+  source_target_id INTEGER NOT NULL REFERENCES source_targets(id),
+  outcome TEXT NOT NULL CHECK(outcome IN ('pending','productive','zero_yield')),
+  completed_at TEXT, paused_at TEXT, pause_reason TEXT, pause_threshold INTEGER
+);
+CREATE TABLE IF NOT EXISTS context_diagnostics (
+  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
+  logical_action TEXT NOT NULL, query_id INTEGER REFERENCES queries(id),
+  created_at TEXT NOT NULL, characters INTEGER NOT NULL,
+  estimated_tokens INTEGER NOT NULL, counts_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS candidate_query_rejections (
   id INTEGER PRIMARY KEY,
   candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+  run_id INTEGER REFERENCES runs(id),
   query_text TEXT NOT NULL, rationale TEXT NOT NULL,
   source_target_key TEXT NOT NULL,
   target_purpose TEXT NOT NULL CHECK(target_purpose IN ('source','dating')),
@@ -148,6 +192,10 @@ CREATE TABLE IF NOT EXISTS evidence (
   primary_source_verified INTEGER NOT NULL DEFAULT 0,
   transmission_verified INTEGER NOT NULL DEFAULT 0,
   discovered_by_query_id INTEGER REFERENCES queries(id),
+  verified_target_id INTEGER REFERENCES source_targets(id),
+  target_verification_note TEXT NOT NULL DEFAULT '',
+  target_artifact_date_verified INTEGER NOT NULL DEFAULT 0,
+  review_covered_at TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(source_id, research_question_id, exact_quote, normalized_claim)
 );
@@ -182,7 +230,8 @@ CREATE TABLE IF NOT EXISTS actions (
 CREATE TABLE IF NOT EXISTS reviews (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
   research_question_id INTEGER NOT NULL REFERENCES questions(id),
-  created_at TEXT NOT NULL, content_json TEXT NOT NULL
+  created_at TEXT NOT NULL, content_json TEXT NOT NULL,
+  included_evidence_ids_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS review_cadence_events (
   id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -335,6 +384,18 @@ class Database:
                 "duplicate_of": "INTEGER REFERENCES queries(id)",
                 "source_target_id": "INTEGER REFERENCES source_targets(id)",
                 "target_purpose": "TEXT NOT NULL DEFAULT 'source'",
+                "search_error": "TEXT",
+                "search_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "search_next_eligible_at": "TEXT",
+            },
+            "archive_lookups": {
+                "retryable": "INTEGER NOT NULL DEFAULT 0",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 1",
+                "next_eligible_at": "TEXT",
+            },
+            "target_search_progress": {
+                "pause_reason": "TEXT",
+                "pause_threshold": "INTEGER",
             },
             "hypotheses": {"archived_at": "TEXT"},
             "sources": {
@@ -354,10 +415,13 @@ class Database:
                 "fetch_final_url": "TEXT",
                 "fetch_redirects_json": "TEXT",
                 "fetch_retryable": "INTEGER",
+                "fetch_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "fetch_next_eligible_at": "TEXT",
                 "original_url": "TEXT",
                 "resolved_original_url": "TEXT",
                 "archive_timestamp": "TEXT",
             },
+            "candidate_query_rejections": {"run_id": "INTEGER REFERENCES runs(id)"},
             "evidence": {
                 "quote_region": "TEXT NOT NULL DEFAULT 'unknown'",
                 "quote_context": "TEXT NOT NULL DEFAULT ''",
@@ -366,7 +430,12 @@ class Database:
                 "term_sense": "TEXT NOT NULL DEFAULT 'unknown'",
                 "primary_source_verified": "INTEGER NOT NULL DEFAULT 0",
                 "transmission_verified": "INTEGER NOT NULL DEFAULT 0",
+                "verified_target_id": "INTEGER REFERENCES source_targets(id)",
+                "target_verification_note": "TEXT NOT NULL DEFAULT ''",
+                "target_artifact_date_verified": "INTEGER NOT NULL DEFAULT 0",
+                "review_covered_at": "TEXT",
             },
+            "reviews": {"included_evidence_ids_json": "TEXT NOT NULL DEFAULT '[]'"},
             "relationships": {"created_at": "TEXT"},
             "runs": {
                 "provider_requests": "INTEGER NOT NULL DEFAULT 0",
@@ -402,6 +471,12 @@ class Database:
                 for name, declaration in columns.items():
                     if name not in existing:
                         self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            self.conn.execute(
+                "UPDATE archive_lookups SET status='retryable',retryable=1,next_eligible_at=? "
+                "WHERE status='gap' AND retryable=0 AND attempt_count<? AND "
+                "(detail LIKE 'CDX lookup failed:%' OR detail='CDX lookup timed out')",
+                (utc_now(), ARCHIVE_MAX_ATTEMPTS),
+            )
             self._refresh_source_targets_tx()
             self.conn.execute(
                 "UPDATE source_targets SET description=REPLACE(description, "
@@ -455,6 +530,32 @@ class Database:
                         row["id"],
                     ),
                 )
+            for row in self.conn.execute(
+                "SELECT id,failure_at,fetch_retryable FROM candidates "
+                "WHERE fetch_error IS NOT NULL AND fetch_attempts=0"
+            ).fetchall():
+                next_eligible = None
+                if row["fetch_retryable"] and row["failure_at"]:
+                    next_eligible = (
+                        datetime.fromisoformat(row["failure_at"]) + timedelta(seconds=60)
+                    ).isoformat()
+                self.conn.execute(
+                    "UPDATE candidates SET fetch_attempts=1,fetch_next_eligible_at=? WHERE id=?",
+                    (next_eligible, row["id"]),
+                )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO fetch_attempt_events "
+                "(candidate_id,attempt_number,failed_at,reason,status_code,retryable,next_eligible_at) "
+                "SELECT id,fetch_attempts,failure_at,fetch_error,fetch_status,"
+                "COALESCE(fetch_retryable,0),fetch_next_eligible_at FROM candidates "
+                "WHERE fetch_error IS NOT NULL AND failure_at IS NOT NULL AND fetch_attempts>0"
+            )
+            self.conn.execute(
+                "UPDATE runs SET actions_taken=(SELECT COUNT(*) FROM actions a "
+                "WHERE a.run_id=runs.id AND a.action NOT IN ('review_context','run_state_recovery')) "
+                "WHERE actions_taken!=(SELECT COUNT(*) FROM actions a WHERE a.run_id=runs.id "
+                "AND a.action NOT IN ('review_context','run_state_recovery'))"
+            )
             if legacy_evidence:
                 self.conn.execute(
                     "UPDATE hypotheses SET status='open',"
@@ -687,7 +788,7 @@ class Database:
             self._enforce_frontier_cap_tx(question_id)
 
     def _refresh_source_targets_tx(self) -> None:
-        # Direct, body-text evidence closes retrieval; page metadata never closes dating.
+        # Target verification is explicit; query association alone cannot close a target.
         before = {
             row["id"]: (row["status"], row["evidence_status"], row["dating_status"])
             for row in self.conn.execute(
@@ -696,20 +797,14 @@ class Database:
         }
         self.conn.execute(
             "UPDATE source_targets SET status='resolved',evidence_status='found',"
-            "dating_status=CASE WHEN EXISTS (SELECT 1 FROM evidence e "
-            "JOIN queries q ON q.id=e.discovered_by_query_id "
-            "WHERE q.source_target_id=source_targets.id AND e.primary_source_verified=1 "
-            "AND e.quote_region='article_body' AND e.quote_verified_date IS NULL "
-            "AND NOT EXISTS (SELECT 1 FROM evidence dated "
-            "JOIN queries dq ON dq.id=dated.discovered_by_query_id "
-            "WHERE dq.source_target_id=source_targets.id "
-            "AND dated.exact_quote=e.exact_quote AND dated.primary_source_verified=1 "
-            "AND dated.quote_region='article_body' "
-            "AND dated.quote_verified_date IS NOT NULL)) "
-            "THEN 'unresolved' ELSE 'resolved' END "
+            "dating_status=CASE WHEN EXISTS (SELECT 1 FROM evidence dated "
+            "WHERE dated.verified_target_id=source_targets.id "
+            "AND dated.primary_source_verified=1 AND dated.quote_region='article_body' "
+            "AND dated.quote_verified_date IS NOT NULL "
+            "AND dated.target_artifact_date_verified=1) "
+            "THEN 'resolved' ELSE dating_status END "
             "WHERE EXISTS (SELECT 1 FROM evidence e "
-            "JOIN queries q ON q.id=e.discovered_by_query_id "
-            "WHERE q.source_target_id=source_targets.id AND e.primary_source_verified=1 "
+            "WHERE e.verified_target_id=source_targets.id AND e.primary_source_verified=1 "
             "AND e.quote_region='article_body')"
         )
         for row in self.conn.execute(
@@ -782,6 +877,14 @@ class Database:
                     and row["target_purpose"] != query.target_purpose
                 ):
                     raise ValueError("Query already has another target purpose")
+                if row["executed_at"] is not None and row["source_target_id"] is None:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO query_target_associations "
+                        "(query_id,source_target_id,target_purpose,rationale,created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (row["id"], target_id, query.target_purpose, query.rationale, utc_now()),
+                    )
+                    return int(row["id"])
                 status = (
                     "deferred"
                     if row["executed_at"] is None
@@ -900,8 +1003,8 @@ class Database:
                 "FROM queries q "
                 "WHERE q.research_question_id=? "
                 "AND q.executed_at IS NULL AND q.status IN ('active','deferred') "
-                "ORDER BY q.priority DESC,q.id",
-                (question_id,),
+                "ORDER BY COALESCE(q.search_next_eligible_at>?,0),q.priority DESC,q.id",
+                (question_id, utc_now()),
             ).fetchall()
             used: dict[int, int] = {}
             active_count = 0
@@ -1020,7 +1123,8 @@ class Database:
             "SELECT q.id FROM queries q WHERE q.research_question_id=? "
             "AND q.executed_at IS NOT NULL AND q.reviewed_at IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.query_id=q.id "
-            "AND c.assessed_at IS NULL AND c.failure_at IS NULL) ORDER BY q.id LIMIT 1",
+            "AND c.assessed_at IS NULL AND (c.failure_at IS NULL OR "
+            "c.fetch_retryable=1)) ORDER BY q.id LIMIT 1",
             (question_id,),
         ).fetchone()
         if row:
@@ -1091,9 +1195,20 @@ class Database:
                 (question_id, hypothesis_since, hypothesis_since, hypothesis_since),
             )
         ]
-        important = sorted(
-            {row["id"] for row in evidence if row["primary_source_verified"]} | contradictions
-        )
+        uncovered = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT id FROM evidence WHERE research_question_id=? "
+                "AND primary_source_verified=1 AND review_covered_at IS NULL "
+                "UNION SELECT e.id FROM evidence e JOIN relationships rel "
+                "ON rel.evidence_id=e.id JOIN hypotheses h ON h.id=rel.hypothesis_id "
+                "WHERE e.research_question_id=? AND h.archived_at IS NULL "
+                "AND rel.kind='contradicts' AND "
+                "(e.review_covered_at IS NULL OR rel.created_at>e.review_covered_at)",
+                (question_id, question_id),
+            )
+        }
+        important = sorted(uncovered)
         return {
             "last_review_at": since,
             "meaningful_actions": actions
@@ -1122,6 +1237,23 @@ class Database:
                 "evidence_ids_json": json.dumps(state["evidence_ids"]),
                 "target_keys_json": json.dumps(state["target_keys"]),
                 "hypothesis_ids_json": json.dumps(state["hypothesis_ids"]),
+            },
+        )
+
+    def record_context_diagnostics(
+        self, run_id: int, action: str, query_id: int | None, context: dict, counts: dict
+    ) -> None:
+        characters = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+        self._insert(
+            "context_diagnostics",
+            {
+                "run_id": run_id,
+                "logical_action": action,
+                "query_id": query_id,
+                "created_at": utc_now(),
+                "characters": characters,
+                "estimated_tokens": (characters + 3) // 4,
+                "counts_json": json.dumps(counts, sort_keys=True),
             },
         )
 
@@ -1157,11 +1289,11 @@ class Database:
         with self.conn:
             target = self.conn.execute(
                 "SELECT id FROM source_targets WHERE research_question_id=? AND key=? "
-                "AND status='unresolved'",
+                "AND (status='unresolved' OR dating_status='unresolved')",
                 (question_id, key),
             ).fetchone()
             if target is None:
-                raise ValueError("Unknown or resolved source target")
+                raise ValueError("Unknown or fully resolved source target")
             self.conn.execute(
                 "INSERT INTO archive_targets "
                 "(source_target_id,original_url,title,start_year,end_year,start_date,end_date) "
@@ -1180,7 +1312,8 @@ class Database:
             "MIN(q.id) query_id "
             "FROM archive_targets a JOIN source_targets t ON t.id=a.source_target_id "
             "JOIN queries q ON q.source_target_id=t.id "
-            "WHERE t.research_question_id=? AND t.status='unresolved' "
+            "WHERE t.research_question_id=? "
+            "AND (t.status='unresolved' OR t.dating_status='unresolved') "
             "GROUP BY a.id ORDER BY a.id",
             (question_id,),
         ).fetchall()
@@ -1192,7 +1325,7 @@ class Database:
             "JOIN archive_targets a ON a.source_target_id=q.source_target_id "
             "JOIN source_targets t ON t.id=q.source_target_id "
             "WHERE q.research_question_id=? AND q.source_target_id IS NOT NULL "
-            "AND t.status='unresolved' "
+            "AND (t.status='unresolved' OR t.dating_status='unresolved') "
             "AND c.failure_at IS NOT NULL AND c.original_url IS NULL ORDER BY c.id",
             (question_id,),
         ).fetchall()
@@ -1208,13 +1341,31 @@ class Database:
                 item["target_url"]
             ).path.rstrip("/"):
                 continue
-            if self.conn.execute(
-                "SELECT 1 FROM archive_lookups WHERE research_question_id=? AND original_url=?",
+            previous = self.conn.execute(
+                "SELECT retryable,attempt_count,next_eligible_at FROM archive_lookups "
+                "WHERE research_question_id=? AND original_url=?",
                 (question_id, url),
-            ).fetchone():
+            ).fetchone()
+            if previous and (
+                not previous["retryable"]
+                or previous["attempt_count"] >= ARCHIVE_MAX_ATTEMPTS
+                or (previous["next_eligible_at"] and previous["next_eligible_at"] > utc_now())
+            ):
                 continue
             return item | {"original_url": url}
         return None
+
+    def has_pending_archive_retry(self, question_id: int) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM archive_lookups a JOIN queries q ON q.id=a.query_id "
+                "JOIN source_targets t ON t.id=q.source_target_id "
+                "WHERE a.research_question_id=? AND a.retryable=1 AND a.attempt_count<? "
+                "AND (t.status='unresolved' OR t.dating_status='unresolved') LIMIT 1",
+                (question_id, ARCHIVE_MAX_ATTEMPTS),
+            ).fetchone()
+            is not None
+        )
 
     def record_archive_lookup(
         self,
@@ -1223,6 +1374,9 @@ class Database:
         original_url: str,
         snapshots: list[Snapshot],
         detail: str,
+        *,
+        retryable: bool = False,
+        retry_delay_seconds: float = 0,
     ) -> None:
         with self.conn:
             query = self.conn.execute(
@@ -1230,17 +1384,36 @@ class Database:
             ).fetchone()
             if query is None or query["research_question_id"] != question_id:
                 raise ValueError("Archive lookup query must belong to the question")
+            previous = self.conn.execute(
+                "SELECT attempt_count FROM archive_lookups "
+                "WHERE research_question_id=? AND original_url=?",
+                (question_id, original_url),
+            ).fetchone()
+            attempts = (previous["attempt_count"] if previous else 0) + 1
+            can_retry = retryable and attempts < ARCHIVE_MAX_ATTEMPTS
+            next_eligible = (
+                (datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)).isoformat()
+                if can_retry
+                else None
+            )
             self.conn.execute(
                 "INSERT INTO archive_lookups "
-                "(research_question_id,query_id,original_url,status,detail,attempted_at) "
-                "VALUES (?,?,?,?,?,?)",
+                "(research_question_id,query_id,original_url,status,detail,attempted_at,"
+                "retryable,attempt_count,next_eligible_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(research_question_id,original_url) "
+                "DO UPDATE SET status=excluded.status,detail=excluded.detail,"
+                "attempted_at=excluded.attempted_at,retryable=excluded.retryable,"
+                "attempt_count=excluded.attempt_count,next_eligible_at=excluded.next_eligible_at",
                 (
                     question_id,
                     query_id,
                     original_url,
-                    "snapshots" if snapshots else "gap",
+                    "snapshots" if snapshots else "retryable" if can_retry else "gap",
                     detail,
                     utc_now(),
+                    int(can_retry),
+                    attempts,
+                    next_eligible,
                 ),
             )
             for snapshot in snapshots:
@@ -1258,19 +1431,62 @@ class Database:
                     ),
                 )
 
-    def persist_plan(self, question_id: int, queries: list[SearchQuery]) -> None:
+    def persist_plan(
+        self, question_id: int, queries: list[SearchQuery], run_id: int | None = None
+    ) -> None:
         with self.conn:
             for query in queries:
                 if query.research_question_id != question_id:
                     raise ValueError("Planned query belongs to another question")
-                self._add_query_tx(query, proposed=True)
+                rejection = self._query_rejection_reason_tx(query)
+                if rejection is None and query.source_target is not None:
+                    existing = self.conn.execute(
+                        "SELECT source_target_id,target_purpose FROM queries "
+                        "WHERE research_question_id=? AND query=?",
+                        (question_id, query.query),
+                    ).fetchone()
+                    if existing and existing["source_target_id"] is not None:
+                        target = self.conn.execute(
+                            "SELECT id FROM source_targets WHERE research_question_id=? AND key=?",
+                            (question_id, query.source_target),
+                        ).fetchone()
+                        if existing["source_target_id"] != target["id"]:
+                            rejection = "Query already belongs to another source target"
+                        elif existing["target_purpose"] != query.target_purpose:
+                            rejection = "Query already has another target purpose"
+                if rejection is None:
+                    self._add_query_tx(query, proposed=True)
+                    continue
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO plan_query_rejections "
+                    "(run_id,research_question_id,query_text,generated_by,rationale,gap,novelty,"
+                    "source_target_key,target_purpose,reason,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        question_id,
+                        query.query,
+                        query.generated_by,
+                        query.rationale,
+                        query.gap,
+                        query.novelty,
+                        query.source_target or "",
+                        query.target_purpose,
+                        rejection,
+                        utc_now(),
+                    ),
+                )
 
     def persist_search_results(
-        self, question_id: int, query_id: int, results: list[tuple[str, str]]
+        self,
+        question_id: int,
+        query_id: int,
+        results: list[tuple[str, str]],
+        run_id: int | None = None,
     ) -> None:
         with self.conn:
             query = self.conn.execute(
-                "SELECT research_question_id,executed_at,status FROM queries WHERE id=?",
+                "SELECT research_question_id,executed_at,status,source_target_id FROM queries WHERE id=?",
                 (query_id,),
             ).fetchone()
             if (
@@ -1286,17 +1502,186 @@ class Database:
                     (query_id, url, title),
                 )
             self.conn.execute(
-                "UPDATE queries SET executed_at=?,status='executed' WHERE id=?",
+                "UPDATE queries SET executed_at=?,status='executed',search_error=NULL,"
+                "search_next_eligible_at=NULL WHERE id=?",
                 (utc_now(), query_id),
             )
+            if run_id is not None and query["source_target_id"] is not None:
+                self.conn.execute(
+                    "INSERT INTO target_search_progress "
+                    "(run_id,query_id,source_target_id,outcome) VALUES (?,?,?,'pending')",
+                    (run_id, query_id, query["source_target_id"]),
+                )
+            self._enforce_frontier_cap_tx(question_id)
+
+    def record_search_failure(
+        self, question_id: int, query_id: int, reason: str, delay_seconds: float
+    ) -> bool:
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT search_attempts FROM queries WHERE id=? AND research_question_id=? "
+                "AND status='active' AND executed_at IS NULL",
+                (query_id, question_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Search query is unavailable")
+            attempts = row["search_attempts"] + 1
+            retryable = attempts < SEARCH_MAX_ATTEMPTS
+            next_eligible = (
+                (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+                if retryable
+                else None
+            )
+            self.conn.execute(
+                "UPDATE queries SET search_error=?,search_attempts=?,"
+                "search_next_eligible_at=?,status=? WHERE id=?",
+                (
+                    reason[:200],
+                    attempts,
+                    next_eligible,
+                    "active" if retryable else "search_failed",
+                    query_id,
+                ),
+            )
+            self._enforce_frontier_cap_tx(question_id)
+            return retryable
+
+    def next_search_query(
+        self, question_id: int, run_id: int, max_consecutive: int
+    ) -> sqlite3.Row | None:
+        with self.conn:
+            self._enforce_frontier_cap_tx(question_id)
+        rows = self.conn.execute(
+            "SELECT q.id,q.query,q.source_target_id,q.search_attempts,"
+            "EXISTS (SELECT 1 FROM target_search_progress p WHERE p.run_id=? "
+            "AND p.source_target_id=q.source_target_id AND p.paused_at IS NOT NULL) paused "
+            "FROM queries q "
+            "WHERE q.research_question_id=? AND q.status='active' AND q.executed_at IS NULL "
+            "AND (q.search_next_eligible_at IS NULL OR q.search_next_eligible_at<=?) "
+            "ORDER BY q.priority DESC,q.id",
+            (run_id, question_id, utc_now()),
+        ).fetchall()
+        if not rows:
+            return None
+        unpaused = [row for row in rows if not row["paused"]]
+        rows = unpaused or rows
+        recent = self.conn.execute(
+            "SELECT source_target_id FROM target_search_progress WHERE run_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (run_id, max_consecutive),
+        ).fetchall()
+        if (
+            len(recent) == max_consecutive
+            and recent[0]["source_target_id"] is not None
+            and all(row["source_target_id"] == recent[0]["source_target_id"] for row in recent)
+        ):
+            alternate = next(
+                (row for row in rows if row["source_target_id"] != recent[0]["source_target_id"]),
+                None,
+            )
+            if alternate is not None:
+                return alternate
+        return rows[0]
+
+    def finalize_target_searches(self, run_id: int, low_yield_searches: int) -> None:
+        with self.conn:
+            pending = self.conn.execute(
+                "SELECT id,run_id,query_id,source_target_id FROM target_search_progress "
+                "WHERE run_id<=? AND outcome='pending' ORDER BY id",
+                (run_id,),
+            ).fetchall()
+            for row in pending:
+                if self.conn.execute(
+                    "SELECT 1 FROM candidates WHERE query_id=? AND assessed_at IS NULL "
+                    "AND (failure_at IS NULL OR (fetch_retryable=1 AND fetch_attempts<?)) "
+                    "LIMIT 1",
+                    (row["query_id"], FETCH_MAX_ATTEMPTS),
+                ).fetchone():
+                    continue
+                productive = (
+                    self.conn.execute(
+                        "SELECT 1 FROM evidence WHERE discovered_by_query_id=? LIMIT 1",
+                        (row["query_id"],),
+                    ).fetchone()
+                    is not None
+                )
+                self.conn.execute(
+                    "UPDATE target_search_progress SET outcome=?,completed_at=? WHERE id=?",
+                    ("productive" if productive else "zero_yield", utc_now(), row["id"]),
+                )
+                if productive:
+                    continue
+                history = self.conn.execute(
+                    "SELECT outcome FROM target_search_progress WHERE run_id=? "
+                    "AND source_target_id=? AND id<=? AND outcome!='pending' ORDER BY id DESC "
+                    "LIMIT ?",
+                    (row["run_id"], row["source_target_id"], row["id"], low_yield_searches),
+                ).fetchall()
+                if len(history) == low_yield_searches and all(
+                    item["outcome"] == "zero_yield" for item in history
+                ):
+                    self.conn.execute(
+                        "UPDATE target_search_progress SET paused_at=?,"
+                        "pause_reason='consecutive_zero_yield',pause_threshold=? WHERE id=?",
+                        (utc_now(), low_yield_searches, row["id"]),
+                    )
+
+    def has_active_searches(self, question_id: int) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM queries WHERE research_question_id=? AND status='active' "
+                "AND executed_at IS NULL LIMIT 1",
+                (question_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def has_pending_search_retry(self, question_id: int) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM queries WHERE research_question_id=? AND status='active' "
+                "AND search_error IS NOT NULL AND search_attempts<? LIMIT 1",
+                (question_id, SEARCH_MAX_ATTEMPTS),
+            ).fetchone()
+            is not None
+        )
+
+    def next_retry_at(self, question_id: int, *, include_archive: bool = True) -> datetime | None:
+        times = [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT search_next_eligible_at FROM queries WHERE research_question_id=? "
+                "AND status='active' AND executed_at IS NULL "
+                "AND search_next_eligible_at IS NOT NULL "
+                "UNION ALL SELECT c.fetch_next_eligible_at FROM candidates c "
+                "JOIN queries q ON q.id=c.query_id WHERE q.research_question_id=? "
+                "AND c.assessed_at IS NULL AND c.fetch_retryable=1 "
+                "AND c.fetch_attempts<? AND c.fetch_next_eligible_at IS NOT NULL "
+                "UNION ALL SELECT a.next_eligible_at FROM archive_lookups a "
+                "JOIN queries q ON q.id=a.query_id "
+                "JOIN source_targets t ON t.id=q.source_target_id "
+                "WHERE a.research_question_id=? AND a.retryable=1 "
+                "AND a.attempt_count<? AND a.next_eligible_at IS NOT NULL "
+                "AND (t.status='unresolved' OR t.dating_status='unresolved')",
+                (
+                    question_id,
+                    question_id,
+                    FETCH_MAX_ATTEMPTS,
+                    question_id if include_archive else -1,
+                    ARCHIVE_MAX_ATTEMPTS,
+                ),
+            )
+        ]
+        return min(map(datetime.fromisoformat, times)) if times else None
 
     def pending_candidate(self, question_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT c.* FROM candidates c JOIN queries q ON q.id=c.query_id "
             "WHERE q.research_question_id=? AND c.assessed_at IS NULL "
-            "AND c.failure_at IS NULL "
+            "AND (c.failure_at IS NULL OR (c.fetch_retryable=1 AND c.fetch_attempts<? "
+            "AND c.fetch_next_eligible_at<=?)) "
             "ORDER BY c.id LIMIT 1",
-            (question_id,),
+            (question_id, FETCH_MAX_ATTEMPTS, utc_now()),
         ).fetchone()
 
     def set_candidate_source(self, candidate_id: int, source_id: int) -> None:
@@ -1328,26 +1713,50 @@ class Database:
         redirect_chain: list[str] | None = None,
     ) -> None:
         with self.conn:
+            candidate = self.conn.execute(
+                "SELECT fetch_attempts FROM candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
+            if candidate is None:
+                raise ValueError("Unknown candidate")
+            attempts = candidate["fetch_attempts"] + 1
+            failed_at = utc_now()
+            can_retry = retryable and attempts < FETCH_MAX_ATTEMPTS
+            next_eligible = (
+                (
+                    datetime.fromisoformat(failed_at) + timedelta(seconds=60 * 2 ** (attempts - 1))
+                ).isoformat()
+                if can_retry
+                else None
+            )
             self.conn.execute(
                 "UPDATE candidates SET fetch_error=?,failure_at=?,fetch_status=?,"
-                "fetch_final_url=?,fetch_redirects_json=?,fetch_retryable=? WHERE id=?",
+                "fetch_final_url=?,fetch_redirects_json=?,fetch_retryable=?,"
+                "fetch_attempts=?,fetch_next_eligible_at=? WHERE id=?",
                 (
                     reason[:200],
-                    utc_now(),
+                    failed_at,
                     status_code,
                     final_url,
                     json.dumps(redirect_chain) if redirect_chain is not None else None,
-                    int(retryable),
+                    int(can_retry),
+                    attempts,
+                    next_eligible,
                     candidate_id,
                 ),
             )
-
-    def requeue_retryable_fetches(self, question_id: int) -> None:
-        with self.conn:
             self.conn.execute(
-                "UPDATE candidates SET failure_at=NULL WHERE fetch_retryable=1 "
-                "AND query_id IN (SELECT id FROM queries WHERE research_question_id=?)",
-                (question_id,),
+                "INSERT INTO fetch_attempt_events "
+                "(candidate_id,attempt_number,failed_at,reason,status_code,retryable,next_eligible_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    candidate_id,
+                    attempts,
+                    failed_at,
+                    reason[:200],
+                    status_code,
+                    int(can_retry),
+                    next_eligible,
+                ),
             )
 
     def record_assessment_failure(self, candidate_id: int, error: str) -> None:
@@ -1377,20 +1786,22 @@ class Database:
     def attach_source(self, candidate_id: int, source: Source) -> int:
         with self.conn:
             candidate = self.conn.execute(
-                "SELECT source_id,assessed_at,failure_at FROM candidates WHERE id=?",
+                "SELECT source_id,assessed_at,failure_at,fetch_retryable "
+                "FROM candidates WHERE id=?",
                 (candidate_id,),
             ).fetchone()
             if (
                 candidate is None
                 or candidate["source_id"] is not None
                 or candidate["assessed_at"]
-                or candidate["failure_at"]
+                or (candidate["failure_at"] and not candidate["fetch_retryable"])
             ):
                 raise ValueError("Candidate is unavailable for source attachment")
             source_id = self._add_source_tx(source)
             self.conn.execute(
                 "UPDATE candidates SET source_id=?,fetch_error=NULL,fetch_status=NULL,"
-                "fetch_final_url=NULL,fetch_redirects_json=NULL,fetch_retryable=NULL "
+                "fetch_final_url=NULL,fetch_redirects_json=NULL,fetch_retryable=NULL,"
+                "failure_at=NULL,fetch_next_eligible_at=NULL "
                 "WHERE id=?",
                 (source_id, candidate_id),
             )
@@ -1441,22 +1852,89 @@ class Database:
         with self.conn:
             return self._add_evidence_tx(evidence)
 
-    def quote_region(self, source_id: int, exact_quote: str) -> QuoteRegion | None:
+    def verify_existing_target_evidence(
+        self, evidence_id: int, target_id: int, verification_note: str
+    ) -> None:
+        if not verification_note.strip():
+            raise ValueError("Target verification requires a note")
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT e.research_question_id,e.primary_source_verified,e.quote_region,"
+                "e.verified_target_id,s.canonical_url,s.original_url,s.resolved_original_url "
+                "FROM evidence e JOIN sources s ON s.id=e.source_id WHERE e.id=?",
+                (evidence_id,),
+            ).fetchone()
+            target = self.conn.execute(
+                "SELECT research_question_id FROM source_targets WHERE id=?", (target_id,)
+            ).fetchone()
+            if (
+                row is None
+                or target is None
+                or row["research_question_id"] != target["research_question_id"]
+                or not row["primary_source_verified"]
+                or row["quote_region"] != QuoteRegion.ARTICLE_BODY
+                or row["verified_target_id"] not in (None, target_id)
+            ):
+                raise ValueError("Evidence is not eligible for this target")
+            known_urls = {
+                item[0]
+                for item in self.conn.execute(
+                    "SELECT original_url FROM archive_targets WHERE source_target_id=?",
+                    (target_id,),
+                )
+            }
+            source_urls = {
+                canonicalize_url(value)
+                for value in (
+                    row["canonical_url"],
+                    row["original_url"],
+                    row["resolved_original_url"],
+                )
+                if value
+            }
+            if known_urls and not known_urls.intersection(source_urls):
+                raise ValueError("Evidence is not from the target's known artifact")
+            self.conn.execute(
+                "UPDATE evidence SET verified_target_id=?,target_verification_note=? "
+                "WHERE id=? AND verified_target_id IS NULL",
+                (target_id, verification_note.strip(), evidence_id),
+            )
+            self._refresh_source_targets_tx()
+
+    def _quote_occurrence(self, source_id: int, exact_quote: str) -> tuple[int, QuoteRegion] | None:
         source = self.conn.execute(
             "SELECT content,regions_json FROM sources WHERE id=?", (source_id,)
         ).fetchone()
-        if source is None:
+        if source is None or not exact_quote:
             return None
-        quote_start = source["content"].find(exact_quote)
-        if quote_start < 0:
-            return None
-        quote_end = quote_start + len(exact_quote)
-        overlaps = {
-            (item["region"], item.get("block_id", 0))
-            for item in json.loads(source["regions_json"])
-            if item["start"] < quote_end and item["end"] > quote_start
-        }
-        return QuoteRegion(next(iter(overlaps))[0]) if len(overlaps) == 1 else QuoteRegion.UNKNOWN
+        regions = json.loads(source["regions_json"])
+        first = None
+        offset = 0
+        while (start := source["content"].find(exact_quote, offset)) >= 0:
+            end = start + len(exact_quote)
+            overlaps = {
+                (item["region"], item.get("block_id", 0))
+                for item in regions
+                if item["start"] < end and item["end"] > start
+            }
+            region = (
+                QuoteRegion(next(iter(overlaps))[0]) if len(overlaps) == 1 else QuoteRegion.UNKNOWN
+            )
+            if region == QuoteRegion.ARTICLE_BODY and any(
+                item["region"] == QuoteRegion.ARTICLE_BODY
+                and item["start"] <= start
+                and item["end"] >= end
+                for item in regions
+            ):
+                return start, region
+            if first is None:
+                first = (start, region)
+            offset = start + 1
+        return first
+
+    def quote_region(self, source_id: int, exact_quote: str) -> QuoteRegion | None:
+        occurrence = self._quote_occurrence(source_id, exact_quote)
+        return occurrence[1] if occurrence else None
 
     def quote_target(self, source_id: int, exact_quote: str) -> str | None:
         source = self.conn.execute(
@@ -1464,9 +1942,10 @@ class Database:
         ).fetchone()
         if source is None:
             return None
-        start = source["content"].find(exact_quote)
-        if start < 0:
+        occurrence = self._quote_occurrence(source_id, exact_quote)
+        if occurrence is None:
             return None
+        start = occurrence[0]
         targets = {
             item["target_url"]
             for item in json.loads(source["regions_json"])
@@ -1478,12 +1957,14 @@ class Database:
 
     def _add_evidence_tx(self, evidence: Evidence) -> int:
         source = self.conn.execute(
-            "SELECT content,regions_json,source_type,title FROM sources WHERE id=?",
+            "SELECT content,regions_json,source_type,title,canonical_url,original_url,"
+            "resolved_original_url FROM sources WHERE id=?",
             (evidence.source_id,),
         ).fetchone()
-        quote_start = -1 if source is None else source["content"].find(evidence.exact_quote)
-        if quote_start < 0:
+        occurrence = self._quote_occurrence(evidence.source_id, evidence.exact_quote)
+        if source is None or occurrence is None:
             raise ValueError("Evidence quote must occur verbatim in the stored source text")
+        quote_start, region = occurrence
         if source["source_type"] == "search_aggregator":
             raise ValueError("Aggregator snippets cannot be evidence")
         corrected_type = _correct_evidence_type(
@@ -1495,7 +1976,52 @@ class Database:
         if corrected_type != evidence.evidence_type.value:
             evidence = evidence.model_copy(update={"evidence_type": EpistemicType(corrected_type)})
         quote_end = quote_start + len(evidence.exact_quote)
-        region = self.quote_region(evidence.source_id, evidence.exact_quote)
+        if evidence.verified_target_id is not None:
+            target = self.conn.execute(
+                "SELECT id FROM source_targets WHERE id=? AND research_question_id=?",
+                (evidence.verified_target_id, evidence.research_question_id),
+            ).fetchone()
+            if (
+                target is None
+                or not evidence.primary_source_verified
+                or region != QuoteRegion.ARTICLE_BODY
+                or not evidence.target_verification_note.strip()
+            ):
+                raise ValueError(
+                    "Target verification requires primary article-body evidence and note"
+                )
+        if evidence.target_artifact_date_verified:
+            if evidence.verified_target_id is None or evidence.quote_verified_date is None:
+                raise ValueError("Target artifact dating requires a verified target and quote date")
+            known_artifacts = self.conn.execute(
+                "SELECT original_url,start_year,end_year,start_date,end_date "
+                "FROM archive_targets WHERE source_target_id=?",
+                (evidence.verified_target_id,),
+            ).fetchall()
+            source_urls = {
+                canonicalize_url(value)
+                for value in (
+                    source["canonical_url"],
+                    source["original_url"],
+                    source["resolved_original_url"],
+                )
+                if value
+            }
+            verified_date = date.fromisoformat(evidence.quote_verified_date)
+            if known_artifacts and not any(
+                row["original_url"] in source_urls
+                and (
+                    row["start_date"] is None
+                    or verified_date >= date.fromisoformat(row["start_date"])
+                )
+                and (
+                    row["end_date"] is None or verified_date <= date.fromisoformat(row["end_date"])
+                )
+                and (row["start_year"] is None or verified_date.year >= row["start_year"])
+                and (row["end_year"] is None or verified_date.year <= row["end_year"])
+                for row in known_artifacts
+            ):
+                raise ValueError("Dated evidence is not the target's known artifact/date")
         if (
             evidence.evidence_type.value
             in {
@@ -1669,6 +2195,8 @@ class Database:
         leads: list[ResearchLead],
         queries: list[SearchQuery],
         mode: str = "full_document",
+        *,
+        run_id: int | None = None,
     ) -> int:
         if mode not in {"full_document", "relevance_windows"}:
             raise ValueError("Unknown assessment mode")
@@ -1685,6 +2213,14 @@ class Database:
             or candidate["failure_at"]
         ):
             raise ValueError("Candidate is unavailable for assessment")
+        if (
+            run_id is not None
+            and not self.conn.execute(
+                "SELECT 1 FROM runs WHERE id=? AND research_question_id=?",
+                (run_id, candidate["research_question_id"]),
+            ).fetchone()
+        ):
+            raise ValueError("Assessment run belongs to another question")
         with self.conn:
             for item, links in evidence:
                 if item.source_id != candidate["source_id"]:
@@ -1703,10 +2239,11 @@ class Database:
                 if rejection is not None:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO candidate_query_rejections "
-                        "(candidate_id,query_text,rationale,source_target_key,"
-                        "target_purpose,reason,created_at) VALUES (?,?,?,?,?,?,?)",
+                        "(candidate_id,run_id,query_text,rationale,source_target_key,"
+                        "target_purpose,reason,created_at) VALUES (?,?,?,?,?,?,?,?)",
                         (
                             candidate_id,
+                            run_id,
                             query.query,
                             query.rationale,
                             query.source_target or "",
@@ -1727,6 +2264,21 @@ class Database:
         return len(evidence)
 
     def _query_rejection_reason_tx(self, query: SearchQuery) -> str | None:
+        if not query.query.strip():
+            return "Query text is empty"
+        if not query.rationale.strip():
+            return "Query rationale is empty"
+        if not query.gap.strip() or not query.novelty.strip():
+            return "Proposed query requires an unresolved gap and novelty explanation"
+        if query.information_value not in {"high", "medium", "low"}:
+            return "Invalid information value"
+        if query.admission_basis not in {
+            "unresolved_gap",
+            "hypothesis_distinction",
+            "primary_source",
+            "new_avenue",
+        }:
+            return "Invalid admission basis"
         if query.source_target is None:
             return (
                 "Dating query requires a source target"
@@ -1823,6 +2375,7 @@ class Database:
         exhausted_avenues: list[tuple[str, str]] | None = None,
         *,
         allow_repeat: bool = False,
+        included_evidence_ids: list[int] | None = None,
     ) -> None:
         with self.conn:
             reviewed = self.conn.execute(
@@ -1831,6 +2384,16 @@ class Database:
             ).fetchone()
             if reviewed is None or (reviewed["reviewed_at"] is not None and not allow_repeat):
                 raise ValueError("Review query is missing or already reviewed")
+            included_ids = list(dict.fromkeys(included_evidence_ids or []))
+            if included_ids:
+                placeholders = ",".join("?" for _ in included_ids)
+                eligible = self.conn.execute(
+                    f"SELECT COUNT(*) FROM evidence WHERE research_question_id=? "
+                    f"AND id IN ({placeholders})",
+                    (question_id, *included_ids),
+                ).fetchone()[0]
+                if eligible != len(included_ids):
+                    raise ValueError("Review evidence must belong to the question")
             known_keys = {
                 row["avenue"]
                 for row in self.conn.execute(
@@ -1840,9 +2403,9 @@ class Database:
                 )
             }
             review_id = self.conn.execute(
-                "INSERT INTO reviews (run_id,research_question_id,created_at,content_json) "
-                "VALUES (?,?,?,?)",
-                (run_id, question_id, utc_now(), content_json),
+                "INSERT INTO reviews (run_id,research_question_id,created_at,content_json,"
+                "included_evidence_ids_json) VALUES (?,?,?,?,?)",
+                (run_id, question_id, utc_now(), content_json, json.dumps(included_ids)),
             ).lastrowid
             for query in queries:
                 if query.research_question_id != question_id:
@@ -1885,6 +2448,12 @@ class Database:
                 "UPDATE queries SET reviewed_at=? WHERE id=? AND research_question_id=?",
                 (utc_now(), query_id, question_id),
             )
+            if included_ids:
+                self.conn.execute(
+                    f"UPDATE evidence SET review_covered_at=? WHERE research_question_id=? "
+                    f"AND id IN ({placeholders})",
+                    (utc_now(), question_id, *included_ids),
+                )
             for key, reason in exhausted_avenues or []:
                 if not key or key != key.strip() or any(char.isspace() for char in key):
                     rejection = "Not an exact avenue ID"
@@ -1997,6 +2566,51 @@ class Database:
 
     def start_run(self, run: ResearchRun) -> int:
         return self._insert("runs", run.model_dump(exclude={"id"}, mode="json"))
+
+    def reconcile_unfinished_runs(self, successor_run_id: int) -> None:
+        """Close predecessors only while the caller holds this question's run lock."""
+        with self.conn:
+            successor = self.conn.execute(
+                "SELECT research_question_id FROM runs WHERE id=? AND status='running'",
+                (successor_run_id,),
+            ).fetchone()
+            if successor is None:
+                raise ValueError("Reconciliation requires a running successor")
+            predecessors = self.conn.execute(
+                "SELECT id,actions_taken,unknown_spend_requests FROM runs "
+                "WHERE research_question_id=? AND id<? AND status='running' AND ended_at IS NULL "
+                "ORDER BY id",
+                (successor["research_question_id"], successor_run_id),
+            ).fetchall()
+            for prior in predecessors:
+                recovered_at = utc_now()
+                reason = (
+                    "Unfinished predecessor; actual stop time unknown. "
+                    f"Reconciled when run {successor_run_id} acquired the question run lock."
+                )
+                self.conn.execute(
+                    "UPDATE runs SET status='interrupted',ended_at=?,stop_reason=? "
+                    "WHERE id=? AND status='running' AND ended_at IS NULL",
+                    (recovered_at, reason, prior["id"]),
+                )
+                self.conn.execute(
+                    "INSERT INTO actions (run_id,occurred_at,action,detail) VALUES (?,?,?,?)",
+                    (
+                        prior["id"],
+                        recovered_at,
+                        "run_state_recovery",
+                        json.dumps(
+                            {
+                                "previous_status": "running",
+                                "new_status": "interrupted",
+                                "superseding_run_id": successor_run_id,
+                                "reason": reason,
+                                "actions_preserved": prior["actions_taken"],
+                                "unknown_spend_requests_preserved": prior["unknown_spend_requests"],
+                            }
+                        ),
+                    ),
+                )
 
     def record_action(
         self,

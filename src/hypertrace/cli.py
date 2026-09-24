@@ -11,7 +11,7 @@ from hypertrace.db import Database
 from hypertrace.llm.openai_compatible import OpenAICompatibleLLM
 from hypertrace.models import Hypothesis, ResearchQuestion
 from hypertrace.planner import seed_motivating_case, seed_source_targets
-from hypertrace.reports import markdown_report
+from hypertrace.reports import latest_run_summary, markdown_report
 from hypertrace.research import Limits, Researcher
 from hypertrace.retrieval.web import BraveWeb
 
@@ -220,6 +220,7 @@ def main(argv: list[str] | None = None) -> None:
                     f"locally estimated cost ${r['locally_estimated_cost']:.4f}; "
                     f"{r['unknown_spend_requests']} with provider billing unknown"
                 )
+                print(latest_run_summary(db, qid))
         elif args.command == "evidence":
             for row in db.rows(
                 "SELECT e.id,e.evidence_type,e.exact_quote,s.retrieved_url "

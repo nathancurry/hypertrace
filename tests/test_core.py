@@ -428,7 +428,7 @@ def test_brave_result_redirect_429_is_recorded_and_run_continues(tmp_path):
                     BraveWeb("key", client),
                     config,
                     question_id,
-                    Limits(max_actions=10),
+                    Limits(max_actions=10, max_minutes=0.01),
                 ).run()
                 candidates = db.rows(
                     "SELECT * FROM candidates WHERE query_id=? ORDER BY id", (query_id,)
@@ -450,13 +450,17 @@ def test_brave_result_redirect_429_is_recorded_and_run_continues(tmp_path):
                 report = markdown_report(db, question_id)
                 assert original in report and final in report
                 assert "retryable: HTTP 429" in report
+                db.conn.execute(
+                    "UPDATE candidates SET fetch_next_eligible_at=? WHERE id=?",
+                    ("2000-01-01T00:00:00+00:00", failed["id"]),
+                )
                 resumed = await Researcher(
                     db,
                     FakeLLM(),
                     BraveWeb("key", client),
                     config,
                     question_id,
-                    Limits(max_actions=10),
+                    Limits(max_actions=10, max_minutes=0.01),
                 ).run()
                 assert db.rows("SELECT status FROM runs WHERE id=?", (resumed,))[0][0] == "stopped"
         assert requested.index(original) < requested.index(final) < requested.index(next_url)
@@ -1379,6 +1383,7 @@ def test_candidate_and_review_commits_roll_back_on_interruption(tmp_path, monkey
         next_query = SearchQuery(
             research_question_id=qid,
             query="older hyperpop use",
+            rationale="Find a dated primary use",
             gap="Earlier usage remains undated",
             novelty="Searches an older period",
         )
@@ -1567,6 +1572,7 @@ def test_candidate_collision_rolls_back_and_retries_once_after_reopen(tmp_path, 
         fresh = SearchQuery(
             research_question_id=qid,
             query="new archive search",
+            rationale="Find another archived capture",
             source_target="pc-music-2014",
             target_purpose="dating",
             gap="Snapshot date is unverified",

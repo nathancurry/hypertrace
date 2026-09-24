@@ -17,6 +17,121 @@ def _cite(url: str, title: str, source_id: int) -> str:
     return f"[{_cell(label)}]({url})"
 
 
+def latest_run_summary(db: Database, question_id: int) -> str | None:
+    """Compact run outcome from the existing durable research records."""
+    runs = db.rows(
+        "SELECT * FROM runs WHERE research_question_id=? ORDER BY id DESC LIMIT 1",
+        (question_id,),
+    )
+    if not runs:
+        return None
+    run = runs[0]
+    run_id = run["id"]
+    actions = db.rows("SELECT action,detail FROM actions WHERE run_id=?", (run_id,))
+    productive = 0
+    search_failures: dict[str, int] = {}
+    retrieval_failures: dict[str, int] = {}
+
+    def failure_category(detail: str) -> str:
+        if "HTTP 429" in detail:
+            return "throttle"
+        if "HTTP 5" in detail:
+            return "server"
+        if "Timeout" in detail or "timed out" in detail:
+            return "timeout"
+        if "Connect" in detail or "Transport" in detail:
+            return "connection"
+        if "HTTP 4" in detail:
+            return "client"
+        return "other"
+
+    for row in actions:
+        action, detail = row["action"], row["detail"]
+        failed = " failed:" in detail or detail.startswith("failed:") or "timed out" in detail
+        if failed and action in {"search", "fetch"}:
+            categories = search_failures if action == "search" else retrieval_failures
+            category = failure_category(detail)
+            categories[category] = categories.get(category, 0) + 1
+        positive_result = (
+            (action == "search" and "results=" in detail and not detail.endswith("results=0"))
+            or (action == "fetch" and detail.startswith("source_id="))
+            or (action in {"assess", "interpret", "plan", "screen_hypothesis"} and not failed)
+            or (
+                action == "archive_lookup"
+                and " useful snapshots" in detail
+                and not detail.endswith("0 useful snapshots")
+            )
+        )
+        productive += int(positive_result)
+
+    ended = run["ended_at"] or "9999-12-31T23:59:59+00:00"
+    evidence_added = db.rows(
+        "SELECT COUNT(*) n FROM evidence WHERE research_question_id=? "
+        "AND created_at>=? AND created_at<=?",
+        (question_id, run["started_at"], ended),
+    )[0]["n"]
+    target_changes = db.rows(
+        "SELECT COUNT(*) n FROM source_targets WHERE research_question_id=? "
+        "AND state_changed_at>=? AND state_changed_at<=?",
+        (question_id, run["started_at"], ended),
+    )[0]["n"]
+    queries = db.rows(
+        "SELECT status,COUNT(*) n FROM queries WHERE research_question_id=? "
+        "AND created_at>=? AND created_at<=? GROUP BY status",
+        (question_id, run["started_at"], ended),
+    )
+    query_counts = {row["status"]: row["n"] for row in queries}
+    reviews = db.rows("SELECT COUNT(*) n FROM reviews WHERE run_id=?", (run_id,))[0]["n"]
+    triggers = db.rows(
+        "SELECT reason,COUNT(*) n FROM review_cadence_events "
+        "WHERE run_id=? AND decision='triggered' GROUP BY reason ORDER BY reason",
+        (run_id,),
+    )
+    attempts = db.rows(
+        "SELECT logical_action,outcome,attempt_order,provider_role,usage_reported,"
+        "estimated_cost,local_estimated_cost FROM provider_attempts WHERE run_id=?",
+        (run_id,),
+    )
+    provider_failures = sum(row["outcome"] != "validated" for row in attempts)
+    provider_retries = sum((row["attempt_order"] or 1) > 1 for row in attempts)
+    provider_failovers = sum(row["provider_role"] == "fallback" for row in attempts)
+
+    def costs(review: bool) -> str:
+        selected = [row for row in attempts if (row["logical_action"] == "review") == review]
+        reported = sum(row["estimated_cost"] or 0 for row in selected if row["usage_reported"])
+        local = sum(row["local_estimated_cost"] or 0 for row in selected)
+        return f"${reported:.4f} reported / ${local:.4f} local"
+
+    def categories(counts: dict[str, int]) -> str:
+        return ", ".join(f"{key} {value}" for key, value in sorted(counts.items())) or "none"
+
+    trigger_reasons = ", ".join(f"{row['reason']} {row['n']}" for row in triggers) or "none"
+    return "\n".join(
+        (
+            (
+                f"Run {run_id}: {run['actions_taken']} actions; {productive} productive research "
+                f"actions; evidence +{evidence_added}; targets changed {target_changes}."
+            ),
+            (
+                f"Failures: search {categories(search_failures)}; retrieval "
+                f"{categories(retrieval_failures)}; provider {provider_failures} failures, "
+                f"{provider_retries} retries, {provider_failovers} failovers."
+            ),
+            (
+                f"Queries: added {sum(query_counts.values())}, deferred "
+                f"{query_counts.get('deferred', 0)}, exhausted "
+                f"{query_counts.get('exhausted', 0)}, rejected "
+                f"{query_counts.get('rejected_duplicate', 0)}; "
+                f"reviews {reviews} (triggers: {trigger_reasons})."
+            ),
+            (
+                f"Cost: research {costs(False)}; review {costs(True)}; "
+                f"billing unknown {run['unknown_spend_requests']} requests."
+            ),
+        )
+    )
+
+
 def markdown_report(db: Database, question_id: int) -> str:
     questions = db.rows("SELECT * FROM questions WHERE id=?", (question_id,))
     if not questions:
@@ -36,10 +151,12 @@ def markdown_report(db: Database, question_id: int) -> str:
         "SELECT e.*,s.canonical_url,s.retrieved_url,s.title,s.page_publication_date,s.dating_notes,"
         "s.author,s.retrieval_date,s.content_hash,s.document_hash,s.source_type,"
         "s.original_url,s.resolved_original_url,s.archive_timestamp,s.archive_url,"
-        "s.http_status,s.redirect_history_json,t.key source_target FROM evidence e "
+        "s.http_status,s.redirect_history_json,t.key source_target,"
+        "vt.key verified_target FROM evidence e "
         "JOIN sources s ON s.id=e.source_id "
         "LEFT JOIN queries q ON q.id=e.discovered_by_query_id "
         "LEFT JOIN source_targets t ON t.id=q.source_target_id "
+        "LEFT JOIN source_targets vt ON vt.id=e.verified_target_id "
         "WHERE e.research_question_id=? "
         "ORDER BY e.quote_verified_date IS NULL,e.quote_verified_date,e.id",
         (question_id,),
@@ -116,6 +233,13 @@ def markdown_report(db: Database, question_id: int) -> str:
         "ORDER BY id",
         (question_id,),
     )
+    secondary_targets = db.rows(
+        "SELECT a.query_id,t.key,a.target_purpose,a.rationale "
+        "FROM query_target_associations a JOIN queries q ON q.id=a.query_id "
+        "JOIN source_targets t ON t.id=a.source_target_id "
+        "WHERE q.research_question_id=? ORDER BY a.id",
+        (question_id,),
+    )
     frontier_counts = {
         row["status"]: row["count"]
         for row in db.rows(
@@ -136,16 +260,28 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     failures = db.rows(
-        "SELECT c.url,c.fetch_error,c.fetch_retryable,c.fetch_status,c.fetch_final_url,"
+        "SELECT c.url,c.fetch_error,c.fetch_retryable,c.fetch_attempts,"
+        "c.fetch_next_eligible_at,c.fetch_status,c.fetch_final_url,"
         "c.fetch_redirects_json,q.query FROM candidates c "
         "JOIN queries q ON q.id=c.query_id "
         "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL ORDER BY c.id",
         (question_id,),
     )
     archive_gaps = db.rows(
-        "SELECT a.original_url,a.detail,q.query FROM archive_lookups a "
+        "SELECT a.original_url,a.detail,a.status,a.attempt_count,a.next_eligible_at,"
+        "q.query FROM archive_lookups a "
         "JOIN queries q ON q.id=a.query_id WHERE a.research_question_id=? "
-        "AND a.status='gap' ORDER BY a.id",
+        "AND a.status IN ('gap','retryable') ORDER BY a.id",
+        (question_id,),
+    )
+    search_failures = db.rows(
+        "SELECT id,query,status,search_error,search_attempts,search_next_eligible_at "
+        "FROM queries WHERE research_question_id=? AND search_error IS NOT NULL ORDER BY id",
+        (question_id,),
+    )
+    plan_rejections = db.rows(
+        "SELECT run_id,query_text,generated_by,source_target_key,target_purpose,reason "
+        "FROM plan_query_rejections WHERE research_question_id=? ORDER BY id",
         (question_id,),
     )
     leads = db.rows(
@@ -185,6 +321,9 @@ def markdown_report(db: Database, question_id: int) -> str:
             f"locally estimated cost ${run['locally_estimated_cost']:.4f}, "
             f"{run['unknown_spend_requests']} requests with provider billing unknown."
         )
+        summary = latest_run_summary(db, question_id)
+        assert summary is not None
+        lines.append(summary)
     cadence = db.review_cadence_state(question_id)
     decision = db.rows(
         "SELECT decision,reason,meaningful_actions,evidence_ids_json,target_keys_json,"
@@ -461,6 +600,14 @@ def markdown_report(db: Database, question_id: int) -> str:
                 f"evidence: {target['evidence_status']}; dating: {target['dating_status']}] "
                 f"— {_cell(target['description'])}"
             )
+    if secondary_targets:
+        lines.extend(["", "### Later target associations", ""])
+        for association in secondary_targets:
+            lines.append(
+                f"- Q{association['query_id']} → `{association['key']}` "
+                f"({association['target_purpose']}) — proposal only; execution provenance unchanged. "
+                f"{_cell(association['rationale'])}"
+            )
     lines.extend(["", "### Deferred leads", ""])
     for query in deferred:
         lines.append(f"- Q{query['id']} `{query['query']}` — {_cell(query['rationale'])}")
@@ -482,14 +629,32 @@ def markdown_report(db: Database, question_id: int) -> str:
             lines.append(
                 f"- [{_cell(failure['url'])}]({failure['url']}) — {state}: "
                 f"{_cell(failure['fetch_error'])}{destination}; "
+                f"attempts {failure['fetch_attempts']}; "
+                f"next eligible {_cell(failure['fetch_next_eligible_at'])}; "
                 f"discovered by `{_cell(failure['query'])}`"
             )
     for gap in archive_gaps:
         lines.append(
-            f"- Wayback lookup for {_cell(gap['original_url'])} — unresolved: "
-            f"{_cell(gap['detail'])}; discovered by `{_cell(gap['query'])}`"
+            f"- Wayback lookup for {_cell(gap['original_url'])} — {gap['status']} "
+            f"after {gap['attempt_count']} attempt(s): {_cell(gap['detail'])}; "
+            f"next eligible {_cell(gap['next_eligible_at'])}; "
+            f"discovered by `{_cell(gap['query'])}`"
         )
-    if not failures and not archive_gaps:
+    for failure in search_failures:
+        lines.append(
+            f"- Search Q{failure['id']} `{_cell(failure['query'])}` — "
+            f"{failure['status']} after {failure['search_attempts']} failure(s): "
+            f"{_cell(failure['search_error'])}; "
+            f"next eligible {_cell(failure['search_next_eligible_at'])}."
+        )
+    for rejection in plan_rejections:
+        lines.append(
+            f"- Planner proposal in run {rejection['run_id']} "
+            f"({_cell(rejection['generated_by'])}): `{_cell(rejection['query_text'])}` "
+            f"[target: {_cell(rejection['source_target_key'])}; "
+            f"{_cell(rejection['target_purpose'])}] — rejected: {_cell(rejection['reason'])}."
+        )
+    if not failures and not archive_gaps and not search_failures and not plan_rejections:
         lines.append("None recorded.")
     lines.extend(
         [
@@ -513,6 +678,9 @@ def markdown_report(db: Database, question_id: int) -> str:
             f"document SHA-256 `{e['document_hash']}`, "
             f"type {_cell(e['source_type'])}; "
             f"author {_cell(e['author'])}; canonical alias {_cell(e['canonical_url'])}; "
+            f"verified target {_cell(e['verified_target'])}; "
+            f"target verification {_cell(e['target_verification_note'])}; "
+            f"target artifact date verified {bool(e['target_artifact_date_verified'])}; "
             f"original {_cell(e['original_url'])}; resolved original "
             f"{_cell(e['resolved_original_url'])}; archive capture "
             f"{_cell(e['archive_timestamp'])}; HTTP {_cell(e['http_status'])}; "

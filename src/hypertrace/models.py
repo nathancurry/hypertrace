@@ -165,6 +165,9 @@ class Evidence(BaseModel):
     primary_source_verified: bool = False
     transmission_verified: bool = False
     discovered_by_query_id: int | None = None
+    verified_target_id: int | None = None
+    target_verification_note: str = ""
+    target_artifact_date_verified: bool = False
     created_at: str = Field(default_factory=utc_now)
 
 

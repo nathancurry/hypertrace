@@ -54,6 +54,10 @@ def test_primary_quote_closes_retrieval_but_not_dating(tmp_path):
                 evidence_type="observed_usage",
                 primary_source_verified=True,
                 discovered_by_query_id=query_id,
+                verified_target_id=db.rows(
+                    "SELECT source_target_id FROM queries WHERE id=?", (query_id,)
+                )[0][0],
+                target_verification_note="Verified target source text",
             )
         )
         target = db.rows(
