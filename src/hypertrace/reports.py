@@ -103,14 +103,15 @@ def markdown_report(db: Database, question_id: int) -> str:
         (question_id,),
     )
     pending = db.rows(
-        "SELECT q.id,q.query,q.rationale,q.gap,q.information_value,"
+        "SELECT q.id,q.query,q.rationale,q.gap,q.information_value,q.target_purpose,"
         "t.key AS source_target FROM queries q LEFT JOIN source_targets t "
         "ON t.id=q.source_target_id WHERE q.research_question_id=? "
         "AND q.status='active' ORDER BY q.priority DESC,q.id LIMIT 15",
         (question_id,),
     )
     source_targets = db.rows(
-        "SELECT key,description,status FROM source_targets WHERE research_question_id=? "
+        "SELECT key,description,status,evidence_status,dating_status FROM source_targets "
+        "WHERE research_question_id=? "
         "ORDER BY id",
         (question_id,),
     )
@@ -410,7 +411,11 @@ def markdown_report(db: Database, question_id: int) -> str:
     )
     if pending:
         for query in pending:
-            target = f" [target: {query['source_target']}]" if query["source_target"] else ""
+            target = (
+                f" [target: {query['source_target']}; {query['target_purpose']}]"
+                if query["source_target"]
+                else ""
+            )
             lines.append(
                 f"- Q{query['id']} `{query['query']}` [{query['information_value']}]"
                 f"{target} — {_cell(query['gap'])}"
@@ -421,7 +426,9 @@ def markdown_report(db: Database, question_id: int) -> str:
         lines.extend(["", "### Source targets", ""])
         for target in source_targets:
             lines.append(
-                f"- `{target['key']}` [{target['status']}] — {_cell(target['description'])}"
+                f"- `{target['key']}` [source: {target['status']}; "
+                f"evidence: {target['evidence_status']}; dating: {target['dating_status']}] "
+                f"— {_cell(target['description'])}"
             )
     lines.extend(["", "### Deferred leads", ""])
     for query in deferred:

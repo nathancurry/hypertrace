@@ -34,7 +34,7 @@ SEED_QUERIES = [
 SOURCE_TARGETS = [
     (
         "pc-music-2014",
-        "Original 2014 text applying hyperpop or hyper-pop to PC Music; especially the attributed Philip Sherburne Pitchfork article at pitchfork.com/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual/ and the source Glenn McDonald recalls. This URL remains unresolved.",
+        "Original 2014 text applying hyperpop or hyper-pop to PC Music; especially the attributed Philip Sherburne Pitchfork article at pitchfork.com/thepitch/485-pc-musics-twisted-electronic-pop-a-users-manual/. Independent dating of the quoted text remains unresolved.",
     ),
     (
         "bjork-transmission",
@@ -83,6 +83,13 @@ TARGET_QUERIES = [
 
 
 def seed_source_targets(db: Database, question_id: int) -> None:
+    resolved = {
+        row["key"]
+        for row in db.rows(
+            "SELECT key FROM source_targets WHERE research_question_id=? AND status='resolved'",
+            (question_id,),
+        )
+    }
     db.install_source_targets(
         question_id,
         SOURCE_TARGETS,
@@ -99,8 +106,11 @@ def seed_source_targets(db: Database, question_id: int) -> None:
                 generated_by="source-target-seed",
             )
             for key, text in TARGET_QUERIES
+            if key not in resolved
         ],
     )
+    if "pc-music-2014" in resolved:
+        return
     db.add_archive_target(
         question_id,
         "pc-music-2014",
@@ -162,8 +172,10 @@ information_value (high/medium/low), novelty (how it differs from executed and p
 searches), and admission_basis (unresolved_gap, hypothesis_distinction, primary_source,
 or new_avenue). Prefer the original source behind an attributed claim. Avoid paraphrases
 and retrospective recaps. Return no queries when the remaining avenues are exhausted.
-When source_targets are supplied, each query must name one unresolved target key in
-source_target. Search for its underlying primary text using quoted wording, author,
+When source_targets are supplied, source-discovery queries must name a target whose
+status is unresolved in source_target. For a target whose source status is resolved and
+dating_status is unresolved, propose only a material independent quote-dating query;
+set target_purpose to dating. Search for unresolved primary text using quoted wording, author,
 publication, date, site, title, archive, and spelling variants. Avoid generic
 "hyperpop history", "origin of hyperpop", or "what is hyperpop" searches.
 Return structured JSON only."""
@@ -194,7 +206,9 @@ For every new query give gap, information_value (high/medium/low), novelty relat
 the existing frontier, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Seek the original text behind attributed claims first.
 Do not propose restatements of existing searches.
-When source_targets are supplied, set source_target to an unresolved target key.
+When source_targets are supplied, use unresolved source targets for source searches.
+For resolved targets, propose only independent quote-dating work when material, with
+target_purpose dating. Never repeat a resolved source hunt.
 Return structured JSON only."""
 
 INTERPRET_SYSTEM = """Interpret persisted evidence conservatively. Do not invent facts.
@@ -222,7 +236,9 @@ outside the schema. Use at most 3 short items in each concern or test list, and 
 next_queries. Each query needs gap, information_value (high/medium/low), novelty
 relative to prior searches, and admission_basis (unresolved_gap, hypothesis_distinction,
 primary_source, or new_avenue). Prefer original sources behind attributed claims.
-When source_targets are supplied, set source_target to an unresolved target key.
+When source_targets are supplied, use unresolved source targets for source searches.
+For resolved targets, propose only independent quote-dating work when material, with
+target_purpose dating. Never repeat a resolved source hunt.
 For exhausted_avenues, copy exactly one avenue_id from the supplied avenues list or
 reviewed_query.avenue_id per item,
 with a concrete reason, only when adequately answered or repeated searches produced no evidence.

@@ -46,6 +46,7 @@ class BudgetStop(Exception):
 
 
 ASSESSMENT_LIMIT = 16_000
+REVIEW_CONTEXT_LIMIT = 24_000  # About 6,000 tokens at the provider's four-character estimate.
 WINDOW_CONTEXT = 400
 SEARCH_STOPWORDS = {
     "about",
@@ -415,6 +416,7 @@ class Researcher:
             dict(row)
             for row in self.db.rows(
                 "SELECT q.id,q.query,q.rationale,q.gap,q.information_value,q.avenue,"
+                "q.target_purpose,"
                 "t.key AS source_target FROM queries q LEFT JOIN source_targets t "
                 "ON t.id=q.source_target_id WHERE q.research_question_id=? "
                 "AND q.status='active' AND q.executed_at IS NULL "
@@ -425,7 +427,7 @@ class Researcher:
         source_targets = [
             dict(row)
             for row in self.db.rows(
-                "SELECT key,description,status FROM source_targets "
+                "SELECT key,description,status,evidence_status,dating_status FROM source_targets "
                 "WHERE research_question_id=? ORDER BY id",
                 (self.question_id,),
             )
@@ -470,6 +472,231 @@ class Researcher:
             "avenues": avenues,
         }
 
+    def _review_context(self, query_id: int) -> tuple[dict, dict]:
+        def short(value: str | None, limit: int = 300) -> str:
+            return (value or "")[:limit]
+
+        qid = self.question_id
+        question = self.db.rows("SELECT question FROM questions WHERE id=?", (qid,))[0][0]
+        hypotheses = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT id,statement,status FROM hypotheses WHERE research_question_id=? "
+                "AND archived_at IS NULL ORDER BY id",
+                (qid,),
+            )
+        ]
+        targets = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT key,status,evidence_status,dating_status,description FROM source_targets "
+                "WHERE research_question_id=? AND (status='unresolved' OR dating_status='unresolved') "
+                "ORDER BY id",
+                (qid,),
+            )
+        ]
+        for target in targets:
+            target["description"] = short(target["description"], 250)
+        reviewed = dict(
+            self.db.rows(
+                "SELECT id,query,avenue AS avenue_id FROM queries "
+                "WHERE id=? AND research_question_id=?",
+                (query_id, qid),
+            )[0]
+        )
+        reviewed["query"] = short(reviewed["query"], 250)
+        previous = self.db.rows(
+            "SELECT created_at,content_json FROM reviews WHERE research_question_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (qid,),
+        )
+        last_review_at = previous[0]["created_at"] if previous else ""
+        earlier = json.loads(previous[0]["content_json"]) if previous else {}
+        conclusions = {
+            key: [short(item, 220) for item in earlier.get(key, [])[:2]]
+            for key in ("overclaims", "dating_concerns", "transmission_gaps")
+        }
+        evidence = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT e.id,e.exact_quote,e.evidence_type,e.confidence,e.term_sense,"
+                "e.quote_verified_date,e.primary_source_verified,e.created_at,"
+                "s.retrieved_url,s.page_publication_date,t.key source_target "
+                "FROM evidence e JOIN sources s ON s.id=e.source_id "
+                "LEFT JOIN queries q ON q.id=e.discovered_by_query_id "
+                "LEFT JOIN source_targets t ON t.id=q.source_target_id "
+                "WHERE e.research_question_id=? ORDER BY e.id DESC",
+                (qid,),
+            )
+        ]
+        links = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT r.evidence_id,r.hypothesis_id,r.kind FROM relationships r "
+                "JOIN evidence e ON e.id=r.evidence_id WHERE e.research_question_id=? "
+                "ORDER BY r.id DESC",
+                (qid,),
+            )
+        ]
+        by_evidence: dict[int, list[dict]] = {}
+        for link in links:
+            by_evidence.setdefault(link["evidence_id"], []).append(link)
+        selected: dict[int, dict] = {}
+
+        def add(item: dict) -> None:
+            if len(selected) < 20:
+                selected.setdefault(item["id"], item)
+
+        def rank(item: dict) -> tuple:
+            return (
+                item["primary_source_verified"],
+                item["quote_verified_date"] is not None,
+                item["evidence_type"] in {"observed_usage", "demonstrated_transmission"},
+                item["id"],
+            )
+
+        for item in evidence:
+            if item["created_at"] > last_review_at:
+                add(item)
+                if len(selected) >= 8:
+                    break
+        for hypothesis in hypotheses:
+            for kind in ("contradicts", "supports", "contextualizes"):
+                matches = [
+                    item
+                    for item in evidence
+                    if any(
+                        link["hypothesis_id"] == hypothesis["id"] and link["kind"] == kind
+                        for link in by_evidence.get(item["id"], [])
+                    )
+                ]
+                for item in sorted(matches, key=rank, reverse=True)[:2]:
+                    add(item)
+        for item in sorted(evidence, key=rank, reverse=True):
+            if item["primary_source_verified"]:
+                add(item)
+            if len(selected) >= 20:
+                break
+        for evidence_type in ("attributed_origin_claim", "observed_usage", "attributed_usage"):
+            for item in sorted(
+                (item for item in evidence if item["evidence_type"] == evidence_type),
+                key=rank,
+                reverse=True,
+            )[:2]:
+                add(item)
+        chosen = []
+        for item in selected.values():
+            chosen.append(
+                {
+                    "id": item["id"],
+                    "quote": short(item["exact_quote"], 700),
+                    "type": item["evidence_type"],
+                    "confidence": item["confidence"],
+                    "term_sense": item["term_sense"],
+                    "quote_verified_date": item["quote_verified_date"],
+                    "page_publication_date": item["page_publication_date"],
+                    "primary_source_verified": bool(item["primary_source_verified"]),
+                    "source_target": item["source_target"],
+                    "url": short(item["retrieved_url"], 220),
+                    "relationships": by_evidence.get(item["id"], [])[:6],
+                }
+            )
+        pending = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT q.id,q.query,q.avenue,q.gap,q.target_purpose,"
+                "t.key source_target FROM queries q "
+                "LEFT JOIN source_targets t ON t.id=q.source_target_id "
+                "WHERE q.research_question_id=? AND q.status='active' AND q.executed_at IS NULL "
+                "ORDER BY q.priority DESC,q.id LIMIT 8",
+                (qid,),
+            )
+        ]
+        for item in pending:
+            item["gap"] = short(item["gap"], 160)
+        avenues = [
+            dict(row)
+            for row in self.db.rows(
+                "SELECT avenue AS avenue_id,COUNT(*) searches FROM queries "
+                "WHERE research_question_id=? AND status='active' AND avenue!='' "
+                "GROUP BY avenue ORDER BY MAX(id) DESC LIMIT 12",
+                (qid,),
+            )
+        ]
+        context = {
+            "question": question,
+            "hypotheses": hypotheses,
+            "source_targets": targets,
+            "reviewed_query": reviewed,
+            "evidence": chosen,
+            "pending_queries": pending,
+            "avenues": avenues,
+            "previous_review_conclusions": conclusions,
+        }
+
+        def size() -> int:
+            return len(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
+
+        for key in ("avenues", "pending_queries", "evidence"):
+            while size() > REVIEW_CONTEXT_LIMIT and context[key]:
+                context[key].pop()
+        if size() > REVIEW_CONTEXT_LIMIT:
+            raise ValueError("Mandatory review context exceeds character budget")
+        counts = {
+            "evidence": {
+                "included": len(context["evidence"]),
+                "omitted": len(evidence) - len(context["evidence"]),
+            },
+            "relationships": {
+                "included": sum(len(item["relationships"]) for item in context["evidence"]),
+                "omitted": len(links)
+                - sum(len(item["relationships"]) for item in context["evidence"]),
+            },
+            "hypotheses": {"included": len(hypotheses), "omitted": 0},
+            "source_targets": {"included": len(targets), "omitted": 0},
+            "pending_queries": {
+                "included": len(context["pending_queries"]),
+                "omitted": self.db.rows(
+                    "SELECT COUNT(*) FROM queries WHERE research_question_id=? "
+                    "AND status='active' AND executed_at IS NULL",
+                    (qid,),
+                )[0][0]
+                - len(context["pending_queries"]),
+            },
+            "avenues": {
+                "included": len(context["avenues"]),
+                "omitted": self.db.rows(
+                    "SELECT COUNT(DISTINCT avenue) FROM queries "
+                    "WHERE research_question_id=? AND status='active' AND avenue!=''",
+                    (qid,),
+                )[0][0]
+                - len(context["avenues"]),
+            },
+            "failed_sources": {
+                "included": 0,
+                "omitted": self.db.rows(
+                    "SELECT COUNT(*) FROM candidates c JOIN queries q ON q.id=c.query_id "
+                    "WHERE q.research_question_id=? AND c.fetch_error IS NOT NULL",
+                    (qid,),
+                )[0][0],
+            },
+            "leads": {
+                "included": 0,
+                "omitted": self.db.rows(
+                    "SELECT COUNT(*) FROM leads WHERE research_question_id=?", (qid,)
+                )[0][0],
+            },
+            "rejected_or_exhausted_queries": {
+                "included": 0,
+                "omitted": self.db.rows(
+                    "SELECT COUNT(*) FROM queries WHERE research_question_id=? "
+                    "AND status IN ('rejected_duplicate','exhausted')",
+                    (qid,),
+                )[0][0],
+            },
+        }
+        return context, counts
+
     async def _plan(self) -> None:
         context = self._context()
         plan = await self._complete(
@@ -491,6 +718,7 @@ class Researcher:
                     novelty=item.novelty,
                     admission_basis=item.admission_basis,
                     source_target=item.source_target,
+                    target_purpose=item.target_purpose,
                     generated_by=self.config.router_model,
                 )
                 for item in plan.queries
@@ -753,6 +981,7 @@ class Researcher:
                 novelty=lead.novelty,
                 admission_basis=lead.admission_basis,
                 source_target=lead.source_target,
+                target_purpose=lead.target_purpose,
                 generated_by=self.model,
             )
             for lead in assessment.new_queries
@@ -837,19 +1066,24 @@ class Researcher:
 
     async def _review(self, query_id: int) -> None:
         try:
-            context = self._context()
-            context["reviewed_query"] = dict(
-                self.db.rows(
-                    "SELECT id,query,avenue AS avenue_id FROM queries "
-                    "WHERE id=? AND research_question_id=?",
-                    (query_id, self.question_id),
-                )[0]
+            context, counts = self._review_context(query_id)
+            prompt = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+            self.db.record_action(
+                self.run_id,
+                "review_context",
+                json.dumps(
+                    {
+                        "characters": len(prompt),
+                        "estimated_tokens": (len(prompt) + 3) // 4,
+                        "counts": counts,
+                    }
+                ),
             )
             review: AdversarialReview = await self._complete(
                 "review",
                 self.config.review_model,
                 REVIEW_SYSTEM,
-                json.dumps(context, ensure_ascii=False),
+                prompt,
                 AdversarialReview,
             )
         except BudgetStop as exc:
@@ -879,6 +1113,7 @@ class Researcher:
                     novelty=lead.novelty,
                     admission_basis=lead.admission_basis,
                     source_target=lead.source_target,
+                    target_purpose=lead.target_purpose,
                     generated_by=self.config.review_model,
                 )
                 for lead in review.next_queries

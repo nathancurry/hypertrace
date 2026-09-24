@@ -120,6 +120,7 @@ class SearchQuery(BaseModel):
     novelty: str = ""
     admission_basis: str = "unresolved_gap"
     source_target: str | None = None
+    target_purpose: Literal["source", "dating"] = "source"
 
 
 class Source(BaseModel):
@@ -210,6 +211,7 @@ class PlannedQuery(BaseModel):
         "unresolved_gap", "hypothesis_distinction", "primary_source", "new_avenue"
     ]
     source_target: str | None = None
+    target_purpose: Literal["source", "dating"] = "source"
 
 
 class QueryPlan(BaseModel):
