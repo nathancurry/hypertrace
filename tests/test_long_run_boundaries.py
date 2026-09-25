@@ -170,7 +170,9 @@ def test_legacy_review_context_does_not_inflate_persisted_action_count(tmp_path)
         qid = db.add_question(ResearchQuestion(question="Where did the term originate?"))
         run_id = db.start_run(ResearchRun(research_question_id=qid, model="test", provider="test"))
         db.record_action(run_id, "review_context", '{"characters":100}')
+        assert db.rows("SELECT actions_taken FROM runs WHERE id=?", (run_id,))[0][0] == 0
         db.record_action(run_id, "review", "completed")
+        db.conn.execute("UPDATE runs SET actions_taken=2 WHERE id=?", (run_id,))
         assert db.rows("SELECT actions_taken FROM runs WHERE id=?", (run_id,))[0][0] == 2
     with Database(path) as db:
         assert db.rows("SELECT actions_taken FROM runs WHERE id=?", (run_id,))[0][0] == 1
@@ -241,6 +243,10 @@ def test_retryable_fetches_keep_history_and_back_off_across_runs(tmp_path):
             assert failed["fetch_retryable"] == int(attempt < FETCH_MAX_ATTEMPTS)
             if attempt < FETCH_MAX_ATTEMPTS:
                 assert failed["fetch_next_eligible_at"] and db.pending_candidate(qid) is None
+                assert (
+                    datetime.fromisoformat(failed["fetch_next_eligible_at"])
+                    - datetime.fromisoformat(failed["failure_at"])
+                ).total_seconds() == 60 * 2 ** (attempt - 1)
             else:
                 assert failed["fetch_next_eligible_at"] is None
         with Database(path) as db:
@@ -271,6 +277,7 @@ def test_latest_run_summary_uses_persisted_outcomes(tmp_path):
         assert "2 actions; 1 productive research actions" in summary
         assert "retrieval throttle 1" in summary
         assert "triggers: action_threshold 1" in summary
+        assert summary in markdown_report(db, qid)
 
 
 def test_productive_target_regains_priority_after_rotation(tmp_path):

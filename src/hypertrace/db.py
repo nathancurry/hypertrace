@@ -2628,6 +2628,8 @@ class Database:
                 "output_tokens,estimated_cost) VALUES (?,?,?,?,?,?,?)",
                 (run_id, utc_now(), action, detail, input_tokens, output_tokens, estimated_cost),
             )
+            if action in {"review_context", "run_state_recovery"}:
+                return
             if aggregate_usage:
                 self.conn.execute(
                     "UPDATE runs SET actions_taken=actions_taken+1,input_tokens=input_tokens+?,"

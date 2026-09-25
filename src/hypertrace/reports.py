@@ -48,6 +48,12 @@ def latest_run_summary(db: Database, question_id: int) -> str | None:
     for row in actions:
         action, detail = row["action"], row["detail"]
         failed = " failed:" in detail or detail.startswith("failed:") or "timed out" in detail
+        relevant_assessment = False
+        if action == "assess" and detail.startswith("{"):
+            try:
+                relevant_assessment = json.loads(detail).get("output", {}).get("relevant") is True
+            except (AttributeError, json.JSONDecodeError):
+                pass
         if failed and action in {"search", "fetch"}:
             categories = search_failures if action == "search" else retrieval_failures
             category = failure_category(detail)
@@ -55,7 +61,8 @@ def latest_run_summary(db: Database, question_id: int) -> str | None:
         positive_result = (
             (action == "search" and "results=" in detail and not detail.endswith("results=0"))
             or (action == "fetch" and detail.startswith("source_id="))
-            or (action in {"assess", "interpret", "plan", "screen_hypothesis"} and not failed)
+            or relevant_assessment
+            or (action in {"interpret", "plan", "screen_hypothesis"} and not failed)
             or (
                 action == "archive_lookup"
                 and " useful snapshots" in detail
@@ -92,7 +99,7 @@ def latest_run_summary(db: Database, question_id: int) -> str | None:
         "estimated_cost,local_estimated_cost FROM provider_attempts WHERE run_id=?",
         (run_id,),
     )
-    provider_failures = sum(row["outcome"] != "validated" for row in attempts)
+    provider_failures = sum(row["outcome"] not in {"validated", "in_flight"} for row in attempts)
     provider_retries = sum((row["attempt_order"] or 1) > 1 for row in attempts)
     provider_failovers = sum(row["provider_role"] == "fallback" for row in attempts)
 
@@ -110,7 +117,7 @@ def latest_run_summary(db: Database, question_id: int) -> str | None:
         (
             (
                 f"Run {run_id}: {run['actions_taken']} actions; {productive} productive research "
-                f"actions; evidence +{evidence_added}; targets changed {target_changes}."
+                f"actions; evidence +{evidence_added}; target transitions {target_changes}."
             ),
             (
                 f"Failures: search {categories(search_failures)}; retrieval "

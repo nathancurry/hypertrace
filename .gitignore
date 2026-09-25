@@ -33,3 +33,4 @@ secrets.env
 *.sqlite3
 hypertrace.db
 report.md
+*.run.lock

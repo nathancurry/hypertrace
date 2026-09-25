@@ -23,30 +23,45 @@ Configure a Brave Search API key and any OpenAI-compatible chat-completions serv
 
 ```sh
 export BRAVE_SEARCH_API_KEY=...
-export LLM_BASE_URL=https://your-provider.example/v1
+export LLM_BASE_URL=https://api.cheaperinference.com/v1
 export LLM_API_KEY=...
-export RESEARCH_MODEL=your-model
-export ROUTER_MODEL=your-model
-export REVIEW_MODEL=your-model
+export RESEARCH_MODEL=glm-5.3-flash
+export ROUTER_MODEL=glm-5.3-flash
+export REVIEW_MODEL=glm-5.3
+unset REVIEW_FALLBACK_BASE_URL REVIEW_FALLBACK_API_KEY REVIEW_FALLBACK_MODEL
+unset REVIEW_FALLBACK_INPUT_COST_PER_MILLION REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION
+export REVIEW_PRIMARY_BASE_URL=https://openrouter.ai/api/v1
+export REVIEW_PRIMARY_API_KEY=...
+export REVIEW_PRIMARY_INPUT_COST_PER_MILLION=...
+export REVIEW_PRIMARY_OUTPUT_COST_PER_MILLION=...
+# Optional review-only fallback:
+# export REVIEW_FALLBACK_BASE_URL=https://other-provider.example/v1
+# export REVIEW_FALLBACK_API_KEY=...
+# export REVIEW_FALLBACK_MODEL=glm-5.3
+# export REVIEW_FALLBACK_INPUT_COST_PER_MILLION=...
+# export REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION=...
 ```
 
-The defaults for `ROUTER_MODEL` and `REVIEW_MODEL` are `RESEARCH_MODEL`. `LLM_JSON_MODE=false` disables the `response_format: json_object` request for providers that only support JSON via prompting. When using a cost limit, set `LLM_INPUT_COST_PER_MILLION` and `LLM_OUTPUT_COST_PER_MILLION` in USD for the models used in that run. Provider attempts are logged separately from logical actions. The run summary distinguishes known estimated cost from requests whose spend is unknown; cost-limited runs stop when usage is unreported. Action and time limits are enforced independently.
+The defaults for `ROUTER_MODEL` and `REVIEW_MODEL` are `RESEARCH_MODEL`. Review primary credentials default to `LLM_BASE_URL` and `LLM_API_KEY`. Enabling fallback requires input and output prices for both review providers, in USD per million tokens. Review failover follows two primary HTTP 429 responses; other model calls keep their existing provider. `LLM_JSON_MODE=false` disables the `response_format: json_object` request for providers that only support JSON via prompting. When using a cost limit, set `LLM_INPUT_COST_PER_MILLION` and `LLM_OUTPUT_COST_PER_MILLION` in USD for the models used in that run. Provider attempts are logged separately from logical actions. The run summary separates cost calculated from provider-reported usage, locally estimated cost when usage is missing, and requests whose provider billing remains unknown. Local estimates use the outgoing request size and visible completion size, with a `HYPERTRACE_LOCAL_USAGE_MULTIPLIER` of 1.25 by default for application-side budgeting; they do not represent provider billing. Action and time limits are enforced independently.
+
+`HYPERTRACE_REVIEW_ACTION_THRESHOLD` defaults to 25 meaningful actions between successful reviews. A new verified primary excerpt, contradiction, or source-target resolution can trigger an earlier review. A clean stop reviews unreviewed material evidence if at least two minutes and one action remain. `HYPERTRACE_REVIEW_QUERY_LIMIT` defaults to 3; review proposals must have high information value. `status` and `report` show the action count and persisted review trigger or skip reason.
 
 ```sh
 uv run hypertrace run --max-actions 30 --max-minutes 20
 uv run hypertrace run --question-id 2 --max-actions 100 --max-cost 1.00 --model stronger-model
 uv run hypertrace status
+uv run hypertrace activate-query 123
 uv run hypertrace evidence
 uv run hypertrace hypotheses
 uv run hypertrace report --output report.md
 ```
 
-Use `--db PATH` before the subcommand or set `HYPERTRACE_DB`. A run stops at its configured action, elapsed-time, cost, or yield limit. Pending candidate pages and queries remain in the database for later runs. `HYPERTRACE_MIN_YIELD` or `--min-yield` sets the minimum observed evidence per distinct assessed document after three such documents; pending query avenues are still searched.
+Use `--db PATH` before the subcommand or set `HYPERTRACE_DB`. A run stops at its configured action, elapsed-time, cost, or yield limit. Pending candidate pages and query records remain in the database for later runs. `HYPERTRACE_ACTIVE_QUERY_LIMIT` caps active searches (default 50); lower-priority leads remain deferred. `activate-query` reconsiders a deferred lead when the cap and priority allow it. `HYPERTRACE_MIN_YIELD` or `--min-yield` sets the minimum observed evidence per distinct assessed document after three such documents.
 
 Each OpenAI-compatible request records sanitized response metadata in `provider_attempts.diagnostics_json`: HTTP status, finish reason, choice and message shape, content state, provider error shape, and top-level keys. Response text, prompts, and API keys are not stored there. Empty, missing, null, or token-limited final content is a provider output failure; reasoning text is never treated as the final answer. A failed adversarial review is recorded in `review_attempts`, stops the run with `review_failed`, and stays due for the next `hypertrace run` on the same database and question. Review requests use an 8000-token completion budget; the CheaperInference `glm-5.3-flash` review request also uses low reasoning effort. A syntactically valid review JSON object that fails schema validation gets one correction call.
 
 ## Evidence rules and limits
 
-Search snippets and excerpts from page furniture are discovery leads only. Evidence excerpts must match fetched article-body text exactly and retain surrounding context and page region. Page publication metadata never dates an excerpt; only independently verified quote dates enter the chronology. Reports cite retrieved URLs and group identical text and revisions, with source independence unresolved. Automated runs cannot establish demonstrated transmission or change accepted hypothesis status; model interpretations are provisional. Earlier uses of the string remain separate from claims about the modern genre term's origin.
+Search snippets and excerpts from page furniture are discovery leads only. Evidence excerpts must match fetched article-body text exactly and retain surrounding context and page region. `observed_usage` records direct use in the stored historical source. Later reports of earlier use, origin or coinage, artist intent, and interpretation have separate categories and remain leads to the original source. Page publication metadata never dates an excerpt; the verified chronology includes only direct usage with an independently verified quote date and primary source. Reports cite retrieved URLs and group identical text and revisions, with source independence unresolved. Automated runs cannot establish demonstrated transmission or change accepted hypothesis status; model interpretations are provisional. Earlier uses of the string remain separate from claims about the modern genre term's origin.
 
 The v1 backend reads ordinary public HTML and plain text. It does not resolve paywalls, JavaScript-only pages, historical snapshots, book scans, or archive-specific dating. Inaccessible, unsupported, and overlong pages remain explicit gaps in reports. Reports may correctly remain inconclusive. No live research is performed by `init`.
