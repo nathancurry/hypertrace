@@ -1,67 +1,59 @@
+[![tests](https://github.com/nathancurry/hypertrace/actions/workflows/test.yml/badge.svg)](https://github.com/nathancurry/hypertrace/actions/workflows/test.yml)
+
 # Hypertrace
 
-Hypertrace is an auditable, bounded research harness for historical terminology and provenance questions. The model proposes searches and interpretations; fetched source text, exact excerpts, source dates, relationships, and review notes live in SQLite.
+A research harness where an LLM proposes searches and reads sources, but code decides what counts as evidence.
 
-## Setup
+Hypertrace runs bounded web research on historical questions, such as where a term first appeared. The model plans searches, reads fetched pages, and suggests interpretations. Every source, exact quote, and model call is stored in SQLite, so any claim in the final report can be traced back to the page text it came from. It is built for questions where a fluent but wrong answer is worse than "inconclusive".
 
-Python 3.13+ and `uv` are required.
+## How a run works
+
+```mermaid
+flowchart TD
+    Q[Question + competing hypotheses] --> P[LLM plans search queries]
+    P --> F[Frontier: dedupe, prioritize, cap active queries]
+    F --> S[Brave web search]
+    S --> C[Candidate URLs]
+    T[Known source targets] --> W[Wayback CDX lookup] --> C
+    C --> X[Fetch page; split article body from page furniture]
+    X --> A[LLM assesses page, proposes quotes + new queries]
+    A --> V{Code check: quote is exact<br/>and in article body?}
+    V -- yes --> E[(Evidence row with source,<br/>offset, region, query)]
+    V -- no --> L[(Stored as an unverified lead)]
+    E --> I[LLM interprets: hypothesis suggestions only]
+    I --> R{Review due?}
+    L --> R
+    R -- yes --> AR[Adversarial review: overclaims,<br/>weak dating, next searches]
+    AR --> F
+    R -- no --> F
+    F -. action / time / cost / yield limit .-> RP[Markdown report with citations and gaps]
+```
+
+## The interesting parts
+
+- **Code enforces provenance.** A model-proposed quote becomes evidence only if it appears verbatim in the fetched article body. Quotes from navigation, sidebars, or search snippets are kept as leads instead. Page publication dates never date a quote. Model interpretations are stored as suggestions and never change a hypothesis's status.
+- **Adversarial review on a schedule.** A separate review model challenges the stored record: overclaims, weak dating, repeated secondary claims. It can retire exhausted search avenues and add up to 3 high-value queries. Review runs after 25 meaningful actions, or earlier when important new evidence arrives. A failed review stops the run and stays due for the next run.
+- **Cost accounting per provider attempt.** Every HTTP attempt is logged with provider, role, retry reason, and token usage. Cost is split into provider-reported, locally estimated, and unknown. Before each call, the worst-case cost (all retries, a schema-repair call, and fallback) is reserved against `--max-cost`.
+- **Rate-limit failover for review.** After two HTTP 429s from the primary review provider, the call moves to a configured fallback provider. `Retry-After` headers are honored. Diagnostics are stored without prompts, response text, or API keys.
+- **Resumable, crash-safe state.** Multi-record state changes are written in single SQLite transactions. A file lock allows one run per question. Failed fetches and searches are kept with retry times, so the next run picks up where the last one stopped.
+
+## Stack
+
+Python 3.13, SQLite, httpx, Pydantic, any OpenAI-compatible chat API, Brave Search API, Internet Archive CDX; pytest and uv.
+
+## Running it
 
 ```sh
 uv sync --extra dev
-uv run hypertrace init
-```
-
-`init` creates `hypertrace.db` and seeds the hyperpop/Hyperballad question with competing hypotheses and independent search avenues. For a different question:
-
-```sh
-uv run hypertrace research "Where did this term originate?" \
-  --hypothesis "The term arose in publication A." \
-  --hypothesis "The term arose independently elsewhere."
-```
-
-Configure a Brave Search API key and any OpenAI-compatible chat-completions service:
-
-```sh
-export BRAVE_SEARCH_API_KEY=...
-export LLM_BASE_URL=https://api.cheaperinference.com/v1
-export LLM_API_KEY=...
-export RESEARCH_MODEL=glm-5.3-flash
-export ROUTER_MODEL=glm-5.3-flash
-export REVIEW_MODEL=glm-5.3
-unset REVIEW_FALLBACK_BASE_URL REVIEW_FALLBACK_API_KEY REVIEW_FALLBACK_MODEL
-unset REVIEW_FALLBACK_INPUT_COST_PER_MILLION REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION
-export REVIEW_PRIMARY_BASE_URL=https://openrouter.ai/api/v1
-export REVIEW_PRIMARY_API_KEY=...
-export REVIEW_PRIMARY_INPUT_COST_PER_MILLION=...
-export REVIEW_PRIMARY_OUTPUT_COST_PER_MILLION=...
-# Optional review-only fallback:
-# export REVIEW_FALLBACK_BASE_URL=https://other-provider.example/v1
-# export REVIEW_FALLBACK_API_KEY=...
-# export REVIEW_FALLBACK_MODEL=glm-5.3
-# export REVIEW_FALLBACK_INPUT_COST_PER_MILLION=...
-# export REVIEW_FALLBACK_OUTPUT_COST_PER_MILLION=...
-```
-
-The defaults for `ROUTER_MODEL` and `REVIEW_MODEL` are `RESEARCH_MODEL`. Review primary credentials default to `LLM_BASE_URL` and `LLM_API_KEY`. Enabling fallback requires input and output prices for both review providers, in USD per million tokens. Review failover follows two primary HTTP 429 responses; other model calls keep their existing provider. `LLM_JSON_MODE=false` disables the `response_format: json_object` request for providers that only support JSON via prompting. When using a cost limit, set `LLM_INPUT_COST_PER_MILLION` and `LLM_OUTPUT_COST_PER_MILLION` in USD for the models used in that run. Provider attempts are logged separately from logical actions. The run summary separates cost calculated from provider-reported usage, locally estimated cost when usage is missing, and requests whose provider billing remains unknown. Local estimates use the outgoing request size and visible completion size, with a `HYPERTRACE_LOCAL_USAGE_MULTIPLIER` of 1.25 by default for application-side budgeting; they do not represent provider billing. Action and time limits are enforced independently.
-
-`HYPERTRACE_REVIEW_ACTION_THRESHOLD` defaults to 25 meaningful actions between successful reviews. A new verified primary excerpt, contradiction, or source-target resolution can trigger an earlier review. A clean stop reviews unreviewed material evidence if at least two minutes and one action remain. `HYPERTRACE_REVIEW_QUERY_LIMIT` defaults to 3; review proposals must have high information value. `status` and `report` show the action count and persisted review trigger or skip reason.
-
-```sh
+uv run pytest                      # 149 tests, no API keys or network needed
+uv run hypertrace init             # seeds the example question (origin of "hyperpop")
+export BRAVE_SEARCH_API_KEY=... LLM_BASE_URL=... LLM_API_KEY=... RESEARCH_MODEL=...
 uv run hypertrace run --max-actions 30 --max-minutes 20
-uv run hypertrace run --question-id 2 --max-actions 100 --max-cost 1.00 --model stronger-model
-uv run hypertrace status
-uv run hypertrace activate-query 123
-uv run hypertrace evidence
-uv run hypertrace hypotheses
 uv run hypertrace report --output report.md
 ```
 
-Use `--db PATH` before the subcommand or set `HYPERTRACE_DB`. A run stops at its configured action, elapsed-time, cost, or yield limit. Pending candidate pages and query records remain in the database for later runs. `HYPERTRACE_ACTIVE_QUERY_LIMIT` caps active searches (default 50); lower-priority leads remain deferred. `activate-query` reconsiders a deferred lead when the cap and priority allow it. `HYPERTRACE_MIN_YIELD` or `--min-yield` sets the minimum observed evidence per distinct assessed document after three such documents.
+Full configuration, review and failover settings, and evidence rules are in [docs/install.md](docs/install.md).
 
-Each OpenAI-compatible request records sanitized response metadata in `provider_attempts.diagnostics_json`: HTTP status, finish reason, choice and message shape, content state, provider error shape, and top-level keys. Response text, prompts, and API keys are not stored there. Empty, missing, null, or token-limited final content is a provider output failure; reasoning text is never treated as the final answer. A failed adversarial review is recorded in `review_attempts`, stops the run with `review_failed`, and stays due for the next `hypertrace run` on the same database and question. Review requests use an 8000-token completion budget; the CheaperInference `glm-5.3-flash` review request also uses low reasoning effort. A syntactically valid review JSON object that fails schema validation gets one correction call.
+## Status
 
-## Evidence rules and limits
-
-Search snippets and excerpts from page furniture are discovery leads only. Evidence excerpts must match fetched article-body text exactly and retain surrounding context and page region. `observed_usage` records direct use in the stored historical source. Later reports of earlier use, origin or coinage, artist intent, and interpretation have separate categories and remain leads to the original source. Page publication metadata never dates an excerpt; the verified chronology includes only direct usage with an independently verified quote date and primary source. Reports cite retrieved URLs and group identical text and revisions, with source independence unresolved. Automated runs cannot establish demonstrated transmission or change accepted hypothesis status; model interpretations are provisional. Earlier uses of the string remain separate from claims about the modern genre term's origin.
-
-The v1 backend reads ordinary public HTML and plain text. It does not resolve paywalls, JavaScript-only pages, historical snapshots, book scans, or archive-specific dating. Inaccessible, unsupported, and overlong pages remain explicit gaps in reports. Reports may correctly remain inconclusive. No live research is performed by `init`.
+Working prototype, run from the command line. The repo ships with one example question.
